@@ -1108,7 +1108,9 @@ export class FixRun extends DurableObject<AppEnv> {
     const r = result as AgentResult | null;
     this.emit({ type: "exit", command: display, exitCode: r?.ok ? 0 : (exitCode ?? null), ms: Date.now() - started });
     const signIn = /401|unauthori[sz]ed|refresh.?token|log ?in again|token.*(expired|revoked|invalid)/i;
-    if (!edits && (signIn.test(stderr) || errors.some((x) => signIn.test(x)) || (r && !r.ok && signIn.test(r.text))))
+    // MCP servers log their own auth errors (OpenCrawl or anything else configured); only Codex's own sign-in counts here.
+    const codexErr = stderr.split("\n").filter((l) => !/\bmcp\b|rmcp|mcp_/i.test(l)).join("\n");
+    if (!edits && (signIn.test(codexErr) || errors.some((x) => !/\bmcp\b/i.test(x) && signIn.test(x)) || (r && !r.ok && signIn.test(r.text))))
       throw new Error("Codex couldn't use the ChatGPT sign-in in CODEX_AUTH_JSON. Run `codex login` locally, then put ~/.codex/auth.json in the secret again");
     if (!r) {
       if (!edits) throw new Error(`Codex ${exitCode === null ? "timed out" : "exited"} without a result${stderr ? `: ${stderr.slice(-300)}` : ""}`);
