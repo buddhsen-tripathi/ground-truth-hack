@@ -323,7 +323,8 @@ export class FixRun extends DurableObject<AppEnv> {
     s.phase = "done";
     this.emit({ type: "log", stream: "err", text: message });
     await this.setStatus("failed");
-    await this.postBoard(s, false);
+    // Only failures from the project's own checks say anything about the bump; sandbox or quota errors would mislead the next run.
+    if (s.attempts.length) await this.postBoard(s, false);
     if (s.sandboxId) {
       const sb = await Sandbox.attach(this.env, s.sandboxId).catch(() => null);
       await sb?.delete();
