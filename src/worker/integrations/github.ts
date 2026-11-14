@@ -42,6 +42,12 @@ async function gh<T>(env: AppEnv, path: string, init: RequestInit & { raw?: bool
     } catch {
       // keep the raw body
     }
+    if (res.status === 403 && init.method && init.method !== "GET" && /not accessible by (personal access|integration)/i.test(message)) {
+      throw new GitHubError(
+        403,
+        "The GitHub token can read this repo but can't write to it. Give it Contents and Pull requests: Read and write on this repo, then open the PR again. The verified fix is kept, so nothing reruns.",
+      );
+    }
     throw new GitHubError(res.status, `GitHub ${res.status} on ${path}: ${message.slice(0, 300)}`);
   }
   return (init.raw ? await res.text() : await res.json()) as T;
