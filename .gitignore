@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env*
+!.dev.vars.example
+src/web/routeTree.gen.ts
+worker-configuration.d.ts
+*.tsbuildinfo
+.DS_Store

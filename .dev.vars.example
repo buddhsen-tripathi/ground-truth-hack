@@ -1,0 +1,14 @@
+# Copy to .dev.vars and fill in. Never commit .dev.vars.
+
+# You.com Search API (https://you.com/platform), sent as X-API-Key
+YOU_API_KEY=
+
+# Clonvo gateway key (sk-cv-v1-…), OpenAI-compatible
+CLONVO_API_KEY=
+
+# Daytona API key (https://app.daytona.io), sandboxes for the fix loop
+DAYTONA_API_KEY=
+
+# GitHub fine-grained PAT, scoped to the demo repos only.
+# Repository permissions: Contents (read & write), Pull requests (read & write), Actions (read), Metadata (read)
+GITHUB_TOKEN=
