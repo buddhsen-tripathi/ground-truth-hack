@@ -22,6 +22,9 @@ function useCountdown(until: string | undefined) {
 export function LivePreview({ runId, preview }: { runId: string; preview: RunPreview }) {
   const qc = useQueryClient();
   const frame = useRef<HTMLIFrameElement>(null);
+  // Dev servers compile the first page on request, so the frame stays blank for a few seconds; cover it until it loads.
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => setLoaded(false), [preview.url]);
   const left = useCountdown(preview.state === "live" ? preview.expiresAt : undefined);
   const stop = useMutation({
     mutationFn: () => api.stopPreview(runId),
@@ -65,7 +68,7 @@ export function LivePreview({ runId, preview }: { runId: string; preview: RunPre
             <span className="hidden shrink-0 font-mono text-xs text-muted-foreground tabular-nums sm:inline" title="The sandbox is deleted when this reaches zero">
               {left}
             </span>
-            <Button variant="ghost" size="icon-sm" title="Reload" aria-label="Reload preview" onClick={() => frame.current && (frame.current.src = preview.url!)}>
+            <Button variant="ghost" size="icon-sm" title="Reload" aria-label="Reload preview" onClick={() => { if (frame.current) { setLoaded(false); frame.current.src = preview.url!; } }}>
               <ArrowClockwise />
             </Button>
             <a href={preview.url} target="_blank" rel="noreferrer" title="Open in a new tab" aria-label="Open preview in a new tab" className="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent">
@@ -86,7 +89,16 @@ export function LivePreview({ runId, preview }: { runId: string; preview: RunPre
         ) : null}
       </div>
       {preview.state === "live" && preview.url ? (
-        <iframe ref={frame} src={preview.url} title="Live preview of the patched app" className="block h-[560px] w-full bg-white" />
+        <div className="relative">
+          <iframe ref={frame} src={preview.url} onLoad={() => setLoaded(true)} title="Live preview of the patched app" className="block h-[560px] w-full bg-white" />
+          {loaded ? null : (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-card px-6 text-center">
+              <Spinner className="size-5 text-info" />
+              <p className="text-sm font-medium text-foreground">Loading the app…</p>
+              <p className="text-xs text-muted-foreground">The dev server compiles the first page on request, which can take a few seconds.</p>
+            </div>
+          )}
+        </div>
       ) : (
         <div className="flex h-[280px] flex-col items-center justify-center gap-3 px-6 text-center">
           <Spinner className="size-5 text-info" />

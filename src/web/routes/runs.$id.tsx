@@ -343,14 +343,25 @@ function RunPage() {
             </ul>
           </Card>
 
-          {activity.length ? <AgentActivity items={activity} agent={result?.agent ?? (activity.some((e) => e.type === "tool" && e.tool.startsWith("codex.")) ? "codex" : "clonvo")} /> : null}
+          {activity.length ? <AgentActivity items={activity} agent={result?.agent} /> : null}
         </div>
       </div>
     </div>
   );
 }
 
-function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "agent" | "tool" }>[]; agent: "codex" | "clonvo" }) {
+/** Who repaired the run, or that nothing needed repairing. */
+function agentSummary(items: Extract<RunEvent, { type: "agent" | "tool" }>[], agent?: "codex" | "clonvo"): string {
+  const codex = items.some((e) => e.type === "tool" && e.tool.startsWith("codex."));
+  const clonvo = items.some((e) => e.type === "agent" || (e.type === "tool" && e.tool.startsWith("clonvo.")));
+  if (agent === "codex") return "Codex repaired the code in the sandbox, coordinating through OpenCrawl";
+  if (agent === "clonvo") return codex ? "Clonvo repaired the code after Codex couldn't" : "Repairs proposed through Clonvo";
+  if (codex) return "Codex in the sandbox, with Clonvo as the fallback";
+  if (clonvo) return "Repairs proposed through Clonvo";
+  return "No repair needed. Tools and integrations this run used";
+}
+
+function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "agent" | "tool" }>[]; agent?: "codex" | "clonvo" }) {
   const [all, setAll] = useState(false);
   const shown = all ? items : items.slice(-14);
   const used = [...new Set(items.filter((e) => e.type === "tool").map((e) => toolLogo((e as { tool: string }).tool)))];
@@ -362,7 +373,7 @@ function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "age
             <Robot weight="bold" className="size-4" /> Agents and tools
           </span>
         }
-        description={agent === "codex" ? "Codex in the sandbox, with Clonvo as the fallback, coordinating through OpenCrawl" : "Repairs proposed through Clonvo"}
+        description={agentSummary(items, agent)}
       />
       {used.length ? (
         <div className="flex flex-wrap gap-1.5 border-b border-border px-5 py-2.5">
