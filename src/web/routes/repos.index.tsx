@@ -1,15 +1,15 @@
-import { ArrowsClockwise, FolderSimple, GithubLogo, LockSimple, Trash, Warning } from "@phosphor-icons/react";
+import { ArrowSquareOut, ArrowsClockwise, FolderSimple, GithubLogo, Lightning, LockSimple, Trash, Warning } from "@phosphor-icons/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 import type { Repo } from "@shared/types";
 import { AddRepoForm } from "@/components/add-repo";
 import { ErrorNote } from "@/components/bits";
-import { Badge, Button, Card, Empty, Mono, PageHeader, Skeleton, Spinner, Tag } from "@/components/ui";
+import { Badge, Button, buttonVariants, Card, Empty, Mono, PageHeader, Skeleton, Spinner, Tag } from "@/components/ui";
 import { api } from "@/lib/api";
 import { nf, timeAgo } from "@/lib/utils";
 
-export const Route = createFileRoute("/repos")({ component: ReposPage });
+export const Route = createFileRoute("/repos/")({ component: ReposPage });
 
 function RepoCard({ repo }: { repo: Repo }) {
   const qc = useQueryClient();
@@ -31,10 +31,16 @@ function RepoCard({ repo }: { repo: Repo }) {
     <Card className="overflow-hidden">
       <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
         <div className="min-w-0">
-          <a href={`https://github.com/${repo.fullName}`} target="_blank" rel="noreferrer" className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground hover:underline">
-            <GithubLogo className="size-4 shrink-0 text-muted-foreground" /> <span className="truncate">{repo.fullName}</span>
+          <div className="flex min-w-0 items-center gap-2">
+            <GithubLogo className="size-4 shrink-0 text-muted-foreground" />
+            <Link to="/repos/$id" params={{ id: repo.id }} className="truncate text-sm font-semibold text-foreground hover:underline">
+              {repo.fullName}
+            </Link>
             {repo.private ? <LockSimple className="size-3.5 shrink-0 text-muted-foreground" /> : null}
-          </a>
+            <a href={`https://github.com/${repo.fullName}`} target="_blank" rel="noreferrer" title="Open on GitHub" className="shrink-0 text-muted-foreground/70 hover:text-foreground">
+              <ArrowSquareOut className="size-3.5" />
+            </a>
+          </div>
           <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
             {repo.defaultBranch}
             {repo.headSha ? ` @ ${repo.headSha.slice(0, 7)}` : ""} · scanned {timeAgo(repo.scannedAt)}
@@ -69,6 +75,16 @@ function RepoCard({ repo }: { repo: Repo }) {
       </div>
       <div className="space-y-4 px-5 py-4 text-[13px]">
         {repo.scanError ? <ErrorNote error={repo.scanError} /> : null}
+        {repo.exposureCount ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger/20 bg-danger-soft px-3 py-2.5">
+            <span className="text-danger">
+              {repo.exposureCount} advisor{repo.exposureCount === 1 ? "y hits" : "ies hit"} this repo. Fix them together in one run and one PR.
+            </span>
+            <Link to="/repos/$id" params={{ id: repo.id }} className={buttonVariants({ size: "sm" })}>
+              <Lightning weight="fill" /> Fix repo
+            </Link>
+          </div>
+        ) : null}
         <div>
           <div className="text-eyebrow mb-2 text-muted-foreground uppercase">Lockfiles · {nf.format(repo.depCount)} resolved</div>
           {repo.lockfiles.length ? (
@@ -82,7 +98,7 @@ function RepoCard({ repo }: { repo: Repo }) {
               ))}
             </ul>
           ) : (
-            <span className="text-muted-foreground">No npm, pnpm, yarn or bun lockfile found.</span>
+            <span className="text-muted-foreground">No npm, pnpm, yarn, bun or uv lockfile, and no pinned requirements file.</span>
           )}
         </div>
         <div>

@@ -134,7 +134,8 @@ export function PipelineGraph({ run, events }: { run: Run; events: RunEvent[] })
   const seen = new Set<RunStep>(events.filter((e) => e.type === "step").map((e) => (e as { step: RunStep }).step));
   seen.add(run.step);
   const repairs = events.filter((e) => e.type === "step" && e.step === "repair").length;
-  const attempts = run.result?.attempts.length ?? events.filter((e) => e.type === "step" && e.step === "test").length;
+  // A repo run checks each lockfile's project once, so only repairs make Checks run again.
+  const attempts = repairs + 1;
   const current = run.step === "repair" ? MAIN.findIndex((m) => m.step === "test") : MAIN.findIndex((m) => m.step === run.step);
 
   const mainState = (i: number): NodeState => {

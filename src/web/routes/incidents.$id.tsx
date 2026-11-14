@@ -1,11 +1,10 @@
 import { ArrowLeft, ArrowSquareOut, Database, GithubLogo, Key, Lightning, Newspaper, ShieldCheck, Warning } from "@phosphor-icons/react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
-import { toast } from "sonner";
 import type { Exposure, Incident } from "@shared/types";
 import { affectedLabel, ErrorNote, KindBadge, RunRow, SeverityText } from "@/components/bits";
-import { Button, Card, CardHeader, Empty, LoadingState, Mono, Spinner, Tag } from "@/components/ui";
+import { buttonVariants, Card, CardHeader, Empty, LoadingState, Mono, Tag } from "@/components/ui";
 import { api } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -26,15 +25,9 @@ function hostname(url: string) {
 }
 
 function ExposureCard({ incident, exposure }: { incident: Incident; exposure: Exposure }) {
-  const navigate = useNavigate();
-  const start = useMutation({
-    mutationFn: () => api.startRun({ incidentId: incident.id, repoId: exposure.repoId, lockfile: exposure.lockfile, version: exposure.version }),
-    onSuccess: (run) => navigate({ to: "/runs/$id", params: { id: run.id } }),
-    onError: (e) => toast.error((e as Error).message),
-  });
   const malicious = incident.kind === "malicious";
   const ciHit = exposure.ciRuns.length > 0;
-  const fixable = incident.ecosystem === "npm";
+  const fixable = incident.ecosystem === "npm" || incident.ecosystem === "PyPI";
   return (
     <Card className="overflow-hidden">
       <div className="flex flex-wrap items-start justify-between gap-3 px-5 py-4">
@@ -52,9 +45,9 @@ function ExposureCard({ incident, exposure }: { incident: Incident; exposure: Ex
           </div>
         </div>
         {fixable ? (
-          <Button onClick={() => start.mutate()} disabled={start.isPending}>
-            {start.isPending ? <Spinner /> : <Lightning weight="fill" />} Generate hotfix
-          </Button>
+          <Link to="/repos/$id" params={{ id: exposure.repoId }} className={buttonVariants()} title="Fix every exposed package in this repo in one run and one PR">
+            <Lightning weight="fill" /> Fix in repo
+          </Link>
         ) : (
           <Tag>Manual fix · {incident.ecosystem}</Tag>
         )}

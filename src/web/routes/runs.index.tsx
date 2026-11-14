@@ -24,7 +24,7 @@ function RunsPage() {
           data.map((r) => <RunRow key={r.id} run={r} />)
         ) : (
           <Empty icon={<Lightning />} title="No runs yet">
-            Open an exposed incident and choose Generate hotfix.
+            Open an exposed repo and choose Fix repo.
           </Empty>
         )}
       </Card>

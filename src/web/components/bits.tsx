@@ -1,7 +1,7 @@
 import { ArrowRight, WarningCircle } from "@phosphor-icons/react";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import type { Incident, Run, RunStatus } from "@shared/types";
+import { planPackages, type FixIncidentRef, type Incident, type Run, type RunStatus } from "@shared/types";
 import { Badge, Card } from "./ui";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -120,15 +120,42 @@ export function RunRow({ run }: { run: Run }) {
       <div className="mt-1.5 flex min-w-0 items-center gap-2">
         <RunStatusBadge status={run.status} />
         <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-          {run.plan ? (
-            <>
-              {run.plan.package} {run.plan.from} <span className="text-muted-foreground/60">→</span> {run.plan.to}
-            </>
-          ) : (
-            run.package
-          )}
+          <RunSummary run={run} />
         </span>
       </div>
+    </Link>
+  );
+}
+
+/** "lodash 4.17.20 → 4.17.21" for a one-package run, "3 packages · axios, debug +1" otherwise. */
+export function RunSummary({ run }: { run: Run }) {
+  const all = planPackages(run.plan);
+  if (!all.length) return <>{run.incidentIds.join(", ")}</>;
+  if (all.length === 1) {
+    const p = all[0]!;
+    return (
+      <>
+        {p.package} {p.from.join(", ")} <span className="text-muted-foreground/60">→</span> {p.to}
+      </>
+    );
+  }
+  const names = [...new Set(all.map((p) => p.package))];
+  return (
+    <>
+      {all.length} packages · {names.slice(0, 2).join(", ")}
+      {names.length > 2 ? ` +${names.length - 2}` : ""}
+    </>
+  );
+}
+
+/** Compact advisory chip for fix plans: malicious, or the severity. */
+export function AdvisoryChip({ incident }: { incident: FixIncidentRef }) {
+  const tone = incident.kind === "malicious" || incident.severity === "critical" || incident.severity === "high" ? "danger" : incident.severity === "moderate" ? "warning" : "neutral";
+  return (
+    <Link to="/incidents/$id" params={{ id: incident.id }} title={incident.title} className="shrink-0">
+      <Badge tone={tone} className="font-mono hover:opacity-80">
+        {incident.kind === "malicious" ? "malicious" : (incident.severity ?? "advisory")} · {incident.id}
+      </Badge>
     </Link>
   );
 }

@@ -1,4 +1,4 @@
-import type { Exposure, Incident, Overview, Repo, Run, RunEvent } from "@shared/types";
+import type { Exposure, FixPlan, Incident, Overview, Repo, Run, RunEvent } from "@shared/types";
 
 export class ApiError extends Error {
   constructor(
@@ -23,7 +23,10 @@ export const api = {
   overview: () => req<Overview>("/overview"),
   checkNow: () => req<{ osvChecked: number; newsChecked: number; newIncidents: number; newExposures: number; errors: string[] }>("/watch/run", { method: "POST" }),
   repos: () => req<Repo[]>("/repos"),
-  repo: (id: string) => req<{ repo: Repo; exposures: Exposure[]; directDeps: { name: string; version: string; lockfile: string; ecosystem: string }[] }>(`/repos/${id}`),
+  repo: (id: string) =>
+    req<{ repo: Repo; exposures: Exposure[]; directDeps: { name: string; version: string; lockfile: string; ecosystem: string }[]; runs: Run[] }>(`/repos/${id}`),
+  fixPlan: (id: string) => req<FixPlan>(`/repos/${id}/fix-plan`),
+  startFix: (id: string, keys: string[]) => req<Run>(`/repos/${id}/fix`, { method: "POST", body: JSON.stringify({ keys }) }),
   addRepo: (fullName: string) => req<Repo>("/repos", { method: "POST", body: JSON.stringify({ fullName }) }),
   rescan: (id: string) => req<Repo>(`/repos/${id}/scan`, { method: "POST" }),
   removeRepo: (id: string) => req<{ ok: true }>(`/repos/${id}`, { method: "DELETE" }),
@@ -31,7 +34,6 @@ export const api = {
   incident: (id: string) => req<{ incident: Incident; exposures: Exposure[]; runs: Run[] }>(`/incidents/${encodeURIComponent(id)}`),
   runs: () => req<Run[]>("/runs"),
   run: (id: string) => req<{ run: Run; events: RunEvent[] }>(`/runs/${id}`),
-  startRun: (body: { incidentId: string; repoId: string; lockfile: string; version: string }) => req<Run>("/runs", { method: "POST", body: JSON.stringify(body) }),
   openPr: (id: string) => req<{ url: string }>(`/runs/${id}/pr`, { method: "POST" }),
   stopPreview: (id: string) => req<{ ok: true }>(`/runs/${id}/preview/stop`, { method: "POST" }),
 };

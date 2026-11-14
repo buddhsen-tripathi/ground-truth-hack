@@ -4,8 +4,8 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import type { Run, RunEvent, RunStep } from "@shared/types";
-import { ErrorNote, RunStatusBadge } from "@/components/bits";
+import { planPackages, type Run, type RunEvent, type RunStep } from "@shared/types";
+import { AdvisoryChip, ErrorNote, RunStatusBadge } from "@/components/bits";
 import { Highlight } from "@/components/highlight";
 import { LivePreview } from "@/components/live-preview";
 import { PipelineGraph } from "@/components/pipeline-graph";
@@ -176,40 +176,52 @@ function RunPage() {
   if (error) return <ErrorNote error={error} />;
   if (!run) return <LoadingState label="Loading run…" className="min-h-[60vh]" />;
   const plan = run.plan;
+  const packages = planPackages(plan);
+  const one = packages.length === 1 ? packages[0]! : null;
+  const managers = [...new Set(plan?.targets.map((t) => t.manager) ?? [])];
+  const verified = run.status === "passed" || run.status === "pr_opened";
+  const npmOnly = !plan?.targets.some((t) => t.ecosystem === "PyPI");
   const result = run.result;
   const agentNotes = events.filter((e) => e.type === "agent") as Extract<RunEvent, { type: "agent" }>[];
 
   return (
     <div>
-      <Link to="/incidents/$id" params={{ id: run.incidentId }} className="mb-5 inline-flex items-center gap-1.5 font-mono text-xs text-muted-foreground hover:text-foreground">
-        <ArrowLeft className="size-3.5" /> {run.incidentId}
+      <Link to="/repos/$id" params={{ id: run.repoId }} className="mb-5 inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+        <ArrowLeft className="size-3.5" /> {run.repoFullName}
       </Link>
       <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
           <div className="mb-3 flex flex-wrap items-center gap-2">
             <RunStatusBadge status={run.status} />
-            {plan ? <Tag>{plan.strategy}</Tag> : null}
-            {plan ? <Tag>{plan.manager}</Tag> : null}
+            {one ? <Tag>{one.strategy}</Tag> : null}
+            {managers.map((m) => (
+              <Tag key={m}>{m}</Tag>
+            ))}
             <span className="font-mono text-xs text-muted-foreground">run {run.id}</span>
           </div>
           <h1 className="text-headline break-words text-foreground">
-            {plan ? (
+            {one ? (
               <>
-                <span className="font-mono text-[0.85em]">{plan.package}</span> <span className="text-danger line-through decoration-2 opacity-80">{plan.from}</span>{" "}
-                <span className="text-muted-foreground">→</span> {run.status === "passed" || run.status === "pr_opened" ? (
+                <span className="font-mono text-[0.85em]">{one.package}</span> <span className="text-danger line-through decoration-2 opacity-80">{one.from.join(", ")}</span>{" "}
+                <span className="text-muted-foreground">→</span>{" "}
+                {verified ? (
                   <Highlight tone="success" serif={false} className="font-mono text-[0.85em]">
-                    {plan.to}
+                    {one.to}
                   </Highlight>
                 ) : (
-                  <span className="text-success">{plan.to}</span>
+                  <span className="text-success">{one.to}</span>
                 )}
               </>
             ) : (
-              run.package
+              <>
+                {verified ? "Bumped " : "Bumping "}
+                {verified ? <Highlight tone="success">{packages.length} packages</Highlight> : `${packages.length} packages`}
+              </>
             )}
           </h1>
           <div className="mt-2 text-sm text-muted-foreground">
-            {run.repoFullName} · {run.incidentTitle}
+            {run.repoFullName} · clears {run.incidentIds.length} advisor{run.incidentIds.length === 1 ? "y" : "ies"}
+            {plan && plan.targets.length > 1 ? ` · ${plan.targets.length} lockfiles` : ""}
           </div>
         </div>
         <Elapsed run={run} />
@@ -272,14 +284,31 @@ function RunPage() {
             )}
           </motion.div>
 
-          {plan ? (
-            <Card className="p-5">
-              <h3 className="text-base font-semibold tracking-tight text-foreground">Why this version</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">{plan.reason}</p>
-              <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                <Mono>{plan.lockfile}</Mono>
-                <Tag>{plan.direct ? "direct" : "transitive"}</Tag>
-              </div>
+          {packages.length ? (
+            <Card className="overflow-hidden">
+              <CardHeader title={one ? "Why this version" : "Changes"} description={one ? undefined : "Each version clears every known advisory for its package"} />
+              <ul>
+                {packages.map((p) => (
+                  <li key={p.key} className="border-b border-border px-5 py-3.5 last:border-b-0">
+                    {one ? null : (
+                      <div className="flex flex-wrap items-baseline gap-x-1.5 font-mono text-[13px]">
+                        <span className="font-medium text-foreground">{p.package}</span>
+                        <span className="text-danger line-through opacity-80">{p.from.join(", ")}</span>
+                        <span className="text-muted-foreground">→</span>
+                        <span className="text-success">{p.to}</span>
+                      </div>
+                    )}
+                    <p className={cn("text-sm leading-6 text-muted-foreground", !one && "mt-1")}>{p.reason}</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <Mono>{p.lockfile}</Mono>
+                      <Tag>{p.direct ? "direct" : "transitive"}</Tag>
+                      {p.incidents.map((i) => (
+                        <AdvisoryChip key={i.id} incident={i} />
+                      ))}
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </Card>
           ) : null}
 
@@ -287,10 +316,18 @@ function RunPage() {
             <CardHeader title="Receipt" description="What was actually checked" />
             <ul className="space-y-3 px-5 py-4 text-sm">
               <ReceiptLine ok={true} label="Ran in an isolated sandbox, no secrets passed in" />
-              <ReceiptLine ok={run.step !== "plan" && run.step !== "sandbox" && run.step !== "clone" && run.step !== "patch" ? true : null} label="Installed with lifecycle scripts disabled" />
-              <ReceiptLine ok={result?.lockfileClean ?? null} label={`Lockfile has no affected ${plan?.package ?? ""} version`} />
+              <ReceiptLine
+                ok={run.step !== "plan" && run.step !== "sandbox" && run.step !== "clone" && run.step !== "patch" ? true : null}
+                label={npmOnly ? "Installed with lifecycle scripts disabled" : "Resolved and checked before anything was installed"}
+              />
+              <ReceiptLine ok={result?.lockfileClean ?? null} label={one ? `Lockfile has no affected ${one.package} version` : "Lockfiles have no affected versions of the bumped packages"} />
               {(result?.attempts ?? []).map((a) => (
-                <ReceiptLine key={a.n} ok={a.passed} label={`Attempt ${a.n}: ${a.command}`} detail={a.passed ? undefined : a.summary} />
+                <ReceiptLine
+                  key={a.n}
+                  ok={a.passed}
+                  label={`Attempt ${a.n}${a.lockfile && plan && plan.targets.length > 1 ? ` (${a.lockfile})` : ""}: ${a.command}`}
+                  detail={a.passed ? undefined : a.summary}
+                />
               ))}
               {!result?.attempts.length ? <ReceiptLine ok={null} label="Project checks" /> : null}
             </ul>
