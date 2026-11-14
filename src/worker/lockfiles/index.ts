@@ -1,5 +1,6 @@
 import { parse as parseYaml } from "yaml";
 import type { ActionRef, Manager } from "@shared/types";
+import { normalizeName } from "../pep440";
 
 export interface ResolvedDep {
   name: string;
@@ -14,11 +15,24 @@ export const LOCKFILE_NAMES: Record<string, Manager> = {
   "yarn.lock": "yarn",
   "bun.lock": "bun",
   "bun.lockb": "bun",
+  "uv.lock": "uv",
 };
+
+/** Pinned pip requirements: requirements.txt, requirements-dev.txt, requirements/base.txt, … */
+const REQUIREMENTS = /(^|\/)(requirements[\w.-]*\.txt|requirements\/[\w.-]+\.txt)$/;
 
 export function managerFor(path: string): Manager | null {
   const base = path.split("/").pop() ?? "";
-  return LOCKFILE_NAMES[base] ?? null;
+  if (LOCKFILE_NAMES[base]) return LOCKFILE_NAMES[base];
+  if (REQUIREMENTS.test(path)) return "pip";
+  return null;
+}
+
+/** The directory a lockfile's project lives in ("" for the root). requirements/*.txt belongs to the folder above. */
+export function lockfileDir(path: string, manager: Manager): string {
+  let dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  if (manager === "pip" && (dir === "requirements" || dir.endsWith("/requirements"))) dir = dir.slice(0, Math.max(0, dir.length - "requirements".length - 1));
+  return dir;
 }
 
 /** Splits "name@version" (scoped names keep their leading "@"). */
@@ -177,8 +191,65 @@ export function parseBunLock(text: string, direct: Set<string>): ResolvedDep[] {
   return dedupe(out);
 }
 
-export function parseLockfile(manager: Manager, path: string, text: string, packageJson: string | null): ResolvedDep[] {
-  const direct = directNames(packageJson);
+// ── Python: uv.lock ─────────────────────────────────────────────────────────────────────────────────
+
+/** Project names a pyproject.toml declares as dependencies (PEP 621 lists, dependency groups, uv dev-dependencies). */
+export function pyprojectDirectNames(pyproject: string | null): Set<string> {
+  const names = new Set<string>();
+  if (!pyproject) return names;
+  // Requirement strings are array elements: a quote right after "[", "," or the start of a line.
+  for (const m of pyproject.matchAll(/(?:^|[[,])\s*["']([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?:[<>=!~;@ ]|["'])/gm)) names.add(normalizeName(m[1]!));
+  return names;
+}
+
+/** uv.lock is TOML; each [[package]] has name, version and source. Only registry packages can be looked up on PyPI. */
+export function parseUvLock(text: string, direct: Set<string>): ResolvedDep[] {
+  const out: ResolvedDep[] = [];
+  let cur: { name?: string; version?: string; registry?: boolean } | null = null;
+  const flush = () => {
+    if (cur?.name && cur.version && cur.registry) out.push({ name: normalizeName(cur.name), version: cur.version, direct: direct.has(normalizeName(cur.name)) });
+    cur = null;
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\[\[package\]\]\s*$/.test(line)) {
+      flush();
+      cur = {};
+      continue;
+    }
+    if (/^\[/.test(line)) {
+      // [package.metadata], [[package.wheels]] … still belong to the current package; any other table ends it.
+      if (!/^\[\[?package\./.test(line)) flush();
+      continue;
+    }
+    if (!cur) continue;
+    const kv = /^(name|version|source)\s*=\s*(.+)$/.exec(line);
+    if (!kv) continue;
+    if (kv[1] === "name") cur.name = kv[2]!.replace(/^"|"$/g, "");
+    else if (kv[1] === "version") cur.version = kv[2]!.replace(/^"|"$/g, "");
+    else cur.registry = /\bregistry\s*=/.test(kv[2]!);
+  }
+  flush();
+  return dedupe(out);
+}
+
+// ── Python: pinned requirements files ───────────────────────────────────────────────────────────────
+
+/** Reads `name==version` pins (extras, markers and hashes allowed). Unpinned lines can't be checked, so they're skipped. */
+export function parseRequirements(text: string): ResolvedDep[] {
+  const out: ResolvedDep[] = [];
+  for (const raw of text.replace(/\\\r?\n/g, " ").split(/\r?\n/)) {
+    const line = raw.replace(/(^|\s)#.*$/, "").trim();
+    if (!line || line.startsWith("-")) continue;
+    const m = /^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*([A-Za-z0-9!+._-]+)\s*(?:;|--|$)/.exec(line);
+    if (m) out.push({ name: normalizeName(m[1]!), version: m[2]!, direct: true });
+  }
+  return dedupe(out);
+}
+
+export function parseLockfile(manager: Manager, path: string, text: string, manifest: string | null): ResolvedDep[] {
+  if (manager === "uv") return parseUvLock(text, pyprojectDirectNames(manifest));
+  if (manager === "pip") return parseRequirements(text);
+  const direct = directNames(manifest);
   switch (manager) {
     case "npm":
       return parseNpmLock(text, direct);

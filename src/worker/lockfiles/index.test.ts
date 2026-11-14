@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBunLock, parseNpmLock, parsePnpmKey, parsePnpmLock, parseWorkflow, parseYarnLock } from "./index";
+import { lockfileDir, managerFor, parseBunLock, parseNpmLock, parsePnpmKey, parsePnpmLock, parseRequirements, parseUvLock, parseWorkflow, parseYarnLock, pyprojectDirectNames } from "./index";
 
 const direct = new Set(["axios", "@tanstack/react-router"]);
 const find = (deps: { name: string; version: string; direct: boolean }[], name: string) => deps.filter((d) => d.name === name);
@@ -157,5 +157,68 @@ describe("workflows", () => {
       { workflow: "ci.yml", uses: "aquasecurity/trivy-action", ref: "0123456789abcdef0123456789abcdef01234567", pinned: true },
     ]);
     expect(secrets).toEqual(["NPM_TOKEN", "AWS_ACCESS_KEY_ID"]);
+  });
+});
+
+describe("python", () => {
+  it("finds uv.lock and pinned requirements files", () => {
+    expect(managerFor("uv.lock")).toBe("uv");
+    expect(managerFor("api/requirements.txt")).toBe("pip");
+    expect(managerFor("requirements-dev.txt")).toBe("pip");
+    expect(managerFor("requirements/base.txt")).toBe("pip");
+    expect(managerFor("docs/notes.txt")).toBeNull();
+    expect(lockfileDir("svc/requirements/base.txt", "pip")).toBe("svc");
+    expect(lockfileDir("svc/uv.lock", "uv")).toBe("svc");
+  });
+
+  it("reads registry packages from uv.lock", () => {
+    const lock = [
+      "version = 1",
+      'requires-python = ">=3.11"',
+      "",
+      "[[package]]",
+      'name = "app"',
+      'version = "0.1.0"',
+      'source = { editable = "." }',
+      "dependencies = [",
+      '    { name = "requests" },',
+      "]",
+      "",
+      "[[package]]",
+      'name = "requests"',
+      'version = "2.31.0"',
+      'source = { registry = "https://pypi.org/simple" }',
+      "dependencies = [",
+      '    { name = "urllib3" },',
+      "]",
+      "wheels = [",
+      '    { url = "https://files.pythonhosted.org/x.whl", hash = "sha256:abc" },',
+      "]",
+      "",
+      "[package.optional-dependencies]",
+      'socks = [{ name = "pysocks" }]',
+      "",
+      "[[package]]",
+      'name = "urllib3"',
+      'version = "1.26.18"',
+      'source = { registry = "https://pypi.org/simple" }',
+    ].join("\n");
+    const pyproject = '[project]\nname = "app"\ndependencies = [\n  "Requests>=2.28,<3",\n  "rich",\n]\n';
+    expect(pyprojectDirectNames(pyproject)).toEqual(new Set(["requests", "rich"]));
+    expect(parseUvLock(lock, pyprojectDirectNames(pyproject))).toEqual([
+      { name: "requests", version: "2.31.0", direct: true },
+      { name: "urllib3", version: "1.26.18", direct: false },
+    ]);
+  });
+
+  it("reads == pins and skips everything else", () => {
+    const deps = parseRequirements(
+      ["# comment", "-r base.txt", "Django==4.2.1 ; python_version >= '3.10'", "requests[socks]==2.31.0 \\", "    --hash=sha256:abc", "flask>=2", "-e .", "PyYAML == 6.0.1  # yaml"].join("\n"),
+    );
+    expect(deps).toEqual([
+      { name: "django", version: "4.2.1", direct: true },
+      { name: "requests", version: "2.31.0", direct: true },
+      { name: "pyyaml", version: "6.0.1", direct: true },
+    ]);
   });
 });

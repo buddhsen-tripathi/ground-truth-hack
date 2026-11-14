@@ -1,7 +1,7 @@
-import type { ActionRef, LockfileSummary, Repo } from "@shared/types";
+import { ecosystemOf, type ActionRef, type LockfileSummary, type Repo } from "@shared/types";
 import { now, shortId, type AppEnv } from "./env";
 import { getBranchSha, getFile, getRepo, getTree } from "./integrations/github";
-import { managerFor, parseLockfile, parseWorkflow, type ResolvedDep } from "./lockfiles";
+import { lockfileDir, managerFor, parseLockfile, parseWorkflow, type ResolvedDep } from "./lockfiles";
 import { getRepoById } from "./db";
 
 const MAX_LOCKFILES = 12;
@@ -31,7 +31,7 @@ export async function scanRepo(env: AppEnv, repoId: string): Promise<Repo> {
   try {
     const sha = await getBranchSha(env, repo.fullName, repo.defaultBranch);
     const tree = await getTree(env, repo.fullName, sha);
-    const files = tree.filter((t) => t.type === "blob" && !t.path.includes("node_modules/"));
+    const files = tree.filter((t) => t.type === "blob" && !/(^|\/)(node_modules|\.venv|venv|site-packages)\//.test(t.path));
     const lockPaths = files.map((f) => f.path).filter((p) => managerFor(p)).slice(0, MAX_LOCKFILES);
     const workflowPaths = files.map((f) => f.path).filter((p) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p));
 
@@ -40,17 +40,23 @@ export async function scanRepo(env: AppEnv, repoId: string): Promise<Repo> {
     for (const path of lockPaths) {
       const manager = managerFor(path)!;
       const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/") + 1) : "";
+      const projectDir = lockfileDir(path, manager);
+      const manifestPath = `${projectDir ? `${projectDir}/` : ""}${manager === "uv" ? "pyproject.toml" : "package.json"}`;
       try {
         if (path.endsWith(".lockb")) {
           // bun.lockb is binary; a text bun.lock next to it is read instead.
           if (lockPaths.includes(`${dir}bun.lock`)) continue;
           throw new Error("Binary bun.lockb can't be read. Run `bun install --save-text-lockfile` to add bun.lock.");
         }
-        const [text, pkg] = await Promise.all([getFile(env, repo.fullName, path, sha), getFile(env, repo.fullName, `${dir}package.json`, sha)]);
+        const [text, manifest] = await Promise.all([
+          getFile(env, repo.fullName, path, sha),
+          manager === "pip" ? Promise.resolve(null) : getFile(env, repo.fullName, manifestPath, sha),
+        ]);
         if (text === null) throw new Error("File not readable");
-        const deps: ResolvedDep[] = parseLockfile(manager, path, text, pkg);
+        const deps: ResolvedDep[] = parseLockfile(manager, path, text, manifest);
+        if (manager === "pip" && !deps.length) throw new Error("No pinned (==) requirements, so there are no exact versions to check.");
         lockfiles.push({ path, manager, packages: deps.length });
-        for (const d of deps) rows.push({ ...d, lockfile: path, ecosystem: "npm" });
+        for (const d of deps) rows.push({ ...d, lockfile: path, ecosystem: ecosystemOf(manager) });
       } catch (e) {
         lockfiles.push({ path, manager, packages: 0, error: (e as Error).message });
       }

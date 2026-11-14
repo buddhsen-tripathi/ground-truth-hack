@@ -1,4 +1,5 @@
 import type { AffectedRange, Incident, Severity, Source } from "@shared/types";
+import { normalizeName } from "../pep440";
 
 const OSV = "https://api.osv.dev/v1";
 
@@ -71,7 +72,8 @@ const SEVERITIES: Record<string, Severity> = { CRITICAL: "critical", HIGH: "high
 /** Maps an OSV record to an incident about one package (an OSV record can cover several). */
 export function toIncident(v: OsvVuln, ecosystem: string, name: string, detectedAt: string): Omit<Incident, "exposureCount"> {
   const malicious = v.id.startsWith("MAL-");
-  const affected = (v.affected ?? []).filter((a) => a.package?.name === name && a.package?.ecosystem === ecosystem);
+  const same = (n: string | undefined) => (ecosystem === "PyPI" ? !!n && normalizeName(n) === normalizeName(name) : n === name);
+  const affected = (v.affected ?? []).filter((a) => same(a.package?.name) && a.package?.ecosystem === ecosystem);
   const versions = affected.flatMap((a) => a.versions ?? []);
   const ranges = affected.flatMap((a) => (a.ranges ?? []).filter((r) => r.type !== "GIT").flatMap((r) => rangesFrom(r.events)));
   const sources: Source[] = [{ kind: "osv", title: `${v.id} on OSV`, url: `https://osv.dev/vulnerability/${v.id}`, publishedAt: v.published }];

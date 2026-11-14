@@ -5,11 +5,13 @@ import { chat, parseJsonReply } from "./integrations/clonvo";
 import { listRunsSince } from "./integrations/github";
 import { getVuln, queryBatch, toIncident } from "./integrations/osv";
 import { search, SECURITY_DOMAINS } from "./integrations/you";
+import { normalizeName } from "./pep440";
 import { isAffected } from "./versions";
 
 const NEWS_QUERIES = [
   "npm packages compromised malicious versions published supply chain attack",
   "GitHub Actions tag hijacked supply chain compromise",
+  "PyPI packages compromised malicious versions published supply chain attack",
 ];
 const MAX_NEW_VULNS = 40;
 const MAX_NEW_ARTICLES = 8;
@@ -86,13 +88,15 @@ async function syncNews(env: AppEnv): Promise<{ checked: number; added: number }
     const article = fresh[x.article];
     if (!article || !x.package || !x.versions?.length) continue;
     const source: Source = { kind: "news", title: article.title, url: article.url, publishedAt: article.pageAge ?? undefined };
-    const confirmed = await env.DB.prepare("SELECT * FROM incidents WHERE ecosystem = ? AND package = ? AND status = 'confirmed'").bind(x.ecosystem, x.package).all();
-    const match = confirmed.results.map(rowToIncident).find((i) => x.versions.some((v) => isAffected(v, i.affected)));
+    // Dependency rows hold PEP 503 names for PyPI, so signals must too or they never match a repo.
+    const pkg = x.ecosystem === "PyPI" ? normalizeName(x.package) : x.package;
+    const confirmed = await env.DB.prepare("SELECT * FROM incidents WHERE ecosystem = ? AND package = ? AND status = 'confirmed'").bind(x.ecosystem, pkg).all();
+    const match = confirmed.results.map(rowToIncident).find((i) => x.versions.some((v) => isAffected(v, i.affected, i.ecosystem)));
     if (match) {
       if (!match.sources.some((s) => s.url === source.url)) await upsertIncident(env, { ...match, sources: [...match.sources, source] });
       continue;
     }
-    const id = `SIG-${await hash(`${x.ecosystem}:${x.package}`)}`;
+    const id = `SIG-${await hash(`${x.ecosystem}:${pkg}`)}`;
     const prev = await getIncident(env, id);
     const versions = [...new Set([...(prev?.affected.versions ?? []), ...x.versions])];
     const incident: Omit<Incident, "exposureCount"> = {
@@ -100,8 +104,8 @@ async function syncNews(env: AppEnv): Promise<{ checked: number; added: number }
       kind: x.kind === "vulnerability" ? "vulnerability" : "malicious",
       status: "unconfirmed",
       ecosystem: x.ecosystem,
-      package: x.package,
-      title: prev?.title ?? `Reported ${x.kind === "vulnerability" ? "vulnerability" : "compromise"} in ${x.package}`,
+      package: pkg,
+      title: prev?.title ?? `Reported ${x.kind === "vulnerability" ? "vulnerability" : "compromise"} in ${pkg}`,
       summary: prev?.summary || article.description,
       severity: x.kind === "vulnerability" ? null : "critical",
       aliases: [],
@@ -132,7 +136,7 @@ export async function matchExposures(env: AppEnv): Promise<number> {
       .bind(incident.ecosystem, incident.package)
       .all<{ repo_id: string; full_name: string; version: string; lockfile: string; direct: number }>();
     for (const d of deps.results) {
-      if (!isAffected(d.version, incident.affected)) continue;
+      if (!isAffected(d.version, incident.affected, incident.ecosystem)) continue;
       desired.set(`${incident.id}|${d.repo_id}|${d.version}|${d.lockfile}`, { incident, repoId: d.repo_id, fullName: d.full_name, version: d.version, lockfile: d.lockfile, direct: !!d.direct });
     }
   }
