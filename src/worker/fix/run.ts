@@ -996,11 +996,20 @@ export class FixRun extends DurableObject<AppEnv> {
     }
     // Every token in the sign-in, so none of them can reach the run log.
     const tokens = auth.tokens && typeof auth.tokens === "object" ? Object.values(auth.tokens as Record<string, unknown>) : [];
-    const oc = this.env.OPENCRAWL_TOKEN;
+    let oc: string | undefined = this.env.OPENCRAWL_TOKEN;
     const secrets = [...tokens, auth.OPENAI_API_KEY, oc].filter((x): x is string => typeof x === "string" && x.length > 8);
     const redact = (x: string) => secrets.reduce((acc, sec) => acc.split(sec).join("***"), x);
 
     await this.ensureCodex(sb);
+    // Some Daytona plans only let sandboxes reach an allowlist (OpenAI, GitHub, npm, PyPI…). Only hand Codex the OpenCrawl
+    // connection, and its token, when the sandbox can actually reach it; the history Firebreak found is in the brief either way.
+    if (oc) {
+      const probe = await sb.exec(`curl -sS -o /dev/null -m 8 -w '%{http_code}' ${shq(`${opencrawlApi(this.env)}/mcp`)} 2>/dev/null`, { timeoutSec: 20 }).catch(() => null);
+      if (!/^[1-5]\d\d$/.test(probe?.output.trim() ?? "")) {
+        oc = undefined;
+        this.emit({ type: "tool", tool: "opencrawl.unreachable", text: "The sandbox can't reach OpenCrawl on this Daytona plan, so Codex works from the history Firebreak passed in" });
+      }
+    }
     const home = "/tmp/fb-codex";
     await sb.exec(`rm -rf ${home} && mkdir -p ${home} && chmod 700 ${home}`);
     // A fresh last_refresh keeps Codex from refreshing the login up front, which would rotate the token you use locally.
