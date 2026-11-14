@@ -1,12 +1,12 @@
 import { ArrowLeft, ArrowSquareOut, ArrowsClockwise, GithubLogo, Lightning, LockSimple, ShieldCheck, Wrench } from "@phosphor-icons/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { planPackages, type FixPlan, type LockfileFix, type PackageFix } from "@shared/types";
 import { AdvisoryChip, ErrorNote, RunRow } from "@/components/bits";
 import { Highlight } from "@/components/highlight";
-import { Badge, Button, Card, CardHeader, Empty, LoadingState, Mono, RowsSkeleton, Spinner, Tag } from "@/components/ui";
+import { Badge, Button, Card, CardHeader, Empty, LoadingState, Mono, RowsSkeleton, SegmentedControl, Spinner, Tag } from "@/components/ui";
 import { api } from "@/lib/api";
 import { cn, nf, timeAgo } from "@/lib/utils";
 
@@ -60,11 +60,24 @@ function LockfileGroup({ t, picked, toggle }: { t: LockfileFix; picked: Set<stri
   );
 }
 
+type FixScope = "all" | "direct";
+
 function FixPlanCard({ repoId, plan, loading, error }: { repoId: string; plan: FixPlan | undefined; loading: boolean; error: unknown }) {
   const navigate = useNavigate();
   const all = useMemo(() => planPackages(plan ?? null), [plan]);
-  // Everything starts checked; unticked keys are what the user left out.
-  const [unticked, setUnticked] = useState<Set<string>>(new Set());
+  // Scope is remembered per repo: "direct" fixes only what package.json / pyproject lists, leaving transitive packages alone.
+  const scopeKey = `firebreak:fix-scope:${repoId}`;
+  const [scope, setScope] = useState<FixScope>(() => (typeof localStorage !== "undefined" && localStorage.getItem(scopeKey) === "direct" ? "direct" : "all"));
+  const untickedFor = (sc: FixScope) => new Set(sc === "direct" ? all.filter((p) => !p.direct).map((p) => p.key) : []);
+  // Unticked keys are what the user left out; the scope decides the starting point.
+  const [unticked, setUnticked] = useState<Set<string>>(() => untickedFor(scope));
+  useEffect(() => setUnticked(untickedFor(scope)), [all]); // eslint-disable-line react-hooks/exhaustive-deps
+  const chooseScope = (sc: FixScope) => {
+    setScope(sc);
+    localStorage.setItem(scopeKey, sc);
+    setUnticked(untickedFor(sc));
+  };
+  const directCount = all.filter((p) => p.direct).length;
   const picked = useMemo(() => new Set(all.map((p) => p.key).filter((k) => !unticked.has(k))), [all, unticked]);
   const toggle = (key: string) =>
     setUnticked((prev) => {
@@ -108,6 +121,22 @@ function FixPlanCard({ repoId, plan, loading, error }: { repoId: string; plan: F
         </Empty>
       ) : (
         <>
+          {directCount && directCount < all.length ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-2.5">
+              <SegmentedControl<FixScope>
+                ariaLabel="Which packages to fix"
+                value={scope}
+                onValueChange={chooseScope}
+                options={[
+                  { value: "all", label: "All", count: all.length },
+                  { value: "direct", label: "Direct only", count: directCount },
+                ]}
+              />
+              <span className="text-xs text-muted-foreground">
+                {scope === "direct" ? "Only packages your manifests list. Transitive ones stay as they are." : "Direct and transitive packages; transitive ones are pinned with overrides."}
+              </span>
+            </div>
+          ) : null}
           {plan!.targets.map((t) => (
             <LockfileGroup key={t.lockfile} t={t} picked={picked} toggle={toggle} />
           ))}
