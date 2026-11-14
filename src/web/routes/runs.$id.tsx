@@ -8,6 +8,7 @@ import { planPackages, type Run, type RunEvent, type RunStep } from "@shared/typ
 import { AdvisoryChip, ErrorNote, RunStatusBadge } from "@/components/bits";
 import { Highlight } from "@/components/highlight";
 import { LivePreview } from "@/components/live-preview";
+import { LOGO_NAMES, Logo, toolAction, toolLogo } from "@/components/logos";
 import { PipelineGraph } from "@/components/pipeline-graph";
 import { Button, Card, CardHeader, LoadingState, Mono, Spinner, Tag } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -67,6 +68,7 @@ function Terminal({ events, live }: { events: RunEvent[]; live: boolean }) {
       else if (ev.type === "exit")
         out.push({ key: `${i}`, cls: ev.exitCode === 0 ? "text-term-success" : "text-term-danger", prefix: ev.exitCode === 0 ? "✓" : "✗", text: `exit ${ev.exitCode ?? "timeout"} · ${(ev.ms / 1000).toFixed(1)}s` });
       else if (ev.type === "agent") out.push({ key: `${i}`, cls: "text-term-warning", prefix: "◆", text: ev.text });
+      else if (ev.type === "tool") out.push({ key: `${i}`, cls: "text-term-accent/90", prefix: "⚙", text: `${ev.tool}  ${ev.text}` });
       else if (ev.type === "log") {
         const text = ev.text.replace(ANSI, "").replace(/\r/g, "");
         text.split("\n").forEach((line, j) => {
@@ -182,7 +184,8 @@ function RunPage() {
   const verified = run.status === "passed" || run.status === "pr_opened";
   const npmOnly = !plan?.targets.some((t) => t.ecosystem === "PyPI");
   const result = run.result;
-  const agentNotes = events.filter((e) => e.type === "agent") as Extract<RunEvent, { type: "agent" }>[];
+  // What the agents and integrations did: tool calls with their logos, and the agent's own notes.
+  const activity = events.filter((e): e is Extract<RunEvent, { type: "agent" | "tool" }> => e.type === "agent" || e.type === "tool");
 
   return (
     <div>
@@ -315,7 +318,10 @@ function RunPage() {
           <Card className="overflow-hidden">
             <CardHeader title="Receipt" description="What was actually checked" />
             <ul className="space-y-3 px-5 py-4 text-sm">
-              <ReceiptLine ok={true} label="Ran in an isolated sandbox, no secrets passed in" />
+              <ReceiptLine
+                ok={true}
+                label={result?.agent === "claude-code" ? "Ran in an isolated sandbox; only the agent's own token went in, after the lockfiles checked clean" : "Ran in an isolated sandbox, no secrets passed in"}
+              />
               <ReceiptLine
                 ok={run.step !== "plan" && run.step !== "sandbox" && run.step !== "clone" && run.step !== "patch" ? true : null}
                 label={npmOnly ? "Installed with lifecycle scripts disabled" : "Resolved and checked before anything was installed"}
@@ -330,25 +336,69 @@ function RunPage() {
                 />
               ))}
               {!result?.attempts.length ? <ReceiptLine ok={null} label="Project checks" /> : null}
+              {result?.agent ? <ReceiptLine ok={verified ? true : null} label={`Repairs by ${result.agent === "claude-code" ? "Claude Code" : "Clonvo"}, checks re-run independently`} /> : null}
+              {result?.history && (result.history.found || result.history.board) ? (
+                <ReceiptLine ok={true} label={`OpenCrawl: ${result.history.found} passages from agent history, ${result.history.board} board notes from other runs`} />
+              ) : null}
             </ul>
           </Card>
 
-          {agentNotes.length ? (
-            <Card className="overflow-hidden">
-              <CardHeader title={<span className="flex items-center gap-1.5"><Robot weight="bold" className="size-4" /> Agent</span>} description="Repairs proposed through Clonvo" />
-              <ul className="space-y-2.5 px-5 py-4 text-sm">
-                {agentNotes.map((n, i) => (
-                  <li key={i} className="flex gap-2">
-                    <Sparkle weight="fill" className="mt-0.5 size-3.5 shrink-0 text-warning" />
-                    <span>{n.text}</span>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          ) : null}
+          {activity.length ? <AgentActivity items={activity} agent={result?.agent ?? (activity.some((e) => e.type === "tool" && e.tool.startsWith("claude.")) ? "claude-code" : "clonvo")} /> : null}
         </div>
       </div>
     </div>
+  );
+}
+
+function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "agent" | "tool" }>[]; agent: "claude-code" | "clonvo" }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? items : items.slice(-14);
+  const used = [...new Set(items.filter((e) => e.type === "tool").map((e) => toolLogo((e as { tool: string }).tool)))];
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader
+        title={
+          <span className="flex items-center gap-1.5">
+            <Robot weight="bold" className="size-4" /> Agents and tools
+          </span>
+        }
+        description={agent === "claude-code" ? "Claude Code in the sandbox, coordinating through OpenCrawl" : "Repairs proposed through Clonvo"}
+      />
+      {used.length ? (
+        <div className="flex flex-wrap gap-1.5 border-b border-border px-5 py-2.5">
+          {used.map((id) => (
+            <span key={id} className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground">
+              <Logo id={id} size={12} className="text-foreground" /> {LOGO_NAMES[id]}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {items.length > shown.length ? (
+        <button type="button" onClick={() => setAll(true)} className="w-full border-b border-border px-5 py-2 text-left text-xs text-muted-foreground hover:text-foreground">
+          Show {items.length - shown.length} earlier
+        </button>
+      ) : null}
+      <ul className="max-h-[420px] space-y-2.5 overflow-auto px-5 py-4 text-sm">
+        {shown.map((n, i) =>
+          n.type === "tool" ? (
+            <li key={i} className="flex gap-2">
+              <span className="mt-px grid size-[18px] shrink-0 place-items-center rounded-[5px] border border-border bg-background text-foreground">
+                <Logo id={toolLogo(n.tool)} size={11} />
+              </span>
+              <span className="min-w-0">
+                <span className="font-mono text-[11px] text-muted-foreground">{toolAction(n.tool)}</span>
+                <span className="block font-mono text-[12px] leading-5 break-words text-foreground/85">{n.text}</span>
+              </span>
+            </li>
+          ) : (
+            <li key={i} className="flex gap-2">
+              <Sparkle weight="fill" className="mt-0.5 size-3.5 shrink-0 text-warning" />
+              <span className="leading-6">{n.text}</span>
+            </li>
+          ),
+        )}
+      </ul>
+    </Card>
   );
 }
 

@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 import { Logo } from "./bits";
+import { Logo as ToolLogo, type LogoId } from "./logos";
 import { Button, Spinner } from "./ui";
 
 /* App shell modelled on nimu-outreach's components/dashboard/app-shell.tsx:
@@ -79,12 +80,14 @@ function WatcherPanel({ collapsed }: { collapsed: boolean }) {
   const { data } = useQuery({ queryKey: ["overview"], queryFn: api.overview, refetchInterval: 15_000 });
   const check = useCheckNow();
   const integrations = data?.watch.integrations;
-  const items: [string, boolean | undefined][] = [
-    ["OSV", true],
-    ["You.com", integrations?.you],
-    ["Clonvo", integrations?.clonvo],
-    ["Daytona", integrations?.daytona],
-    ["GitHub", integrations?.github],
+  const items: [string, LogoId, boolean | undefined][] = [
+    ["OSV", "osv", true],
+    ["Daytona", "daytona", integrations?.daytona],
+    ["GitHub", "github", integrations?.github],
+    ["Claude Code", "claude", integrations?.claudeCode],
+    ["OpenCrawl", "opencrawl", integrations?.opencrawl],
+    ["Clonvo", "clonvo", integrations?.clonvo],
+    ["You.com", "you", integrations?.you],
   ];
   if (collapsed)
     return (
@@ -111,11 +114,14 @@ function WatcherPanel({ collapsed }: { collapsed: boolean }) {
       <Button variant="outline" size="sm" className="w-full" onClick={() => check.mutate()} disabled={check.isPending}>
         {check.isPending ? <Spinner /> : <ArrowsClockwise />} Check now
       </Button>
-      <div className="flex flex-wrap gap-x-3 gap-y-1 px-2 pt-0.5">
-        {items.map(([name, on]) => (
-          <span key={name} className="flex items-center gap-1.5 text-[11px] text-sidebar-foreground/60" title={on ? `${name} connected` : `${name} key missing`}>
-            <span className={cn("size-1.5 rounded-full", on ? "bg-success" : "bg-danger")} />
-            {name}
+      <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 px-2 pt-1">
+        {items.map(([name, logo, on]) => (
+          <span key={name} className={cn("flex min-w-0 items-center gap-1.5 text-[11px] text-sidebar-foreground/70", !on && "opacity-55")} title={on ? `${name} connected` : `${name} not configured`}>
+            <span className="relative grid size-[18px] shrink-0 place-items-center rounded-[5px] border border-sidebar-border bg-sidebar text-sidebar-foreground">
+              <ToolLogo id={logo} size={11} />
+              <span className={cn("absolute -right-0.5 -bottom-0.5 size-1.5 rounded-full ring-1 ring-sidebar", on ? "bg-success" : "bg-danger")} />
+            </span>
+            <span className="truncate">{name}</span>
           </span>
         ))}
       </div>
