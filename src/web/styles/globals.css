@@ -1,0 +1,263 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Tokens mirror nimu-outreach (apps/web-tan/src/styles/app.css): warm cream light theme,
+ * neutral charcoal dark theme, mint primary, Inter + JetBrains Mono, 0.5rem radius.
+ * Firebreak adds status tones (success / warning / danger / info, each with a soft tint)
+ * and a neutral terminal surface for the sandbox log.
+ */
+:root {
+  --background: oklch(0.966 0.013 88.003);
+  --foreground: oklch(0.235 0 0);
+  --card: oklch(0.99 0.006 86.4257);
+  --card-foreground: oklch(0.235 0 0);
+  --popover: oklch(0.99 0.006 86.4257);
+  --popover-foreground: oklch(0.235 0 0);
+  --primary: oklch(0.72 0.15 158);
+  --primary-foreground: oklch(0.26 0.06 158);
+  --secondary: oklch(0.935 0.016 87.5232);
+  --secondary-foreground: oklch(0.3012 0 0);
+  --muted: oklch(0.93 0.016 87.163);
+  --muted-foreground: oklch(0.4688 0.0136 84.5932);
+  --accent: oklch(0.95 0.015 99.616);
+  --accent-foreground: oklch(0.3012 0 0);
+  --destructive: oklch(0.5771 0.2152 27.325);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.895 0.017 87.1621);
+  --input: oklch(0.895 0.017 87.1621);
+  --ring: oklch(0.72 0.15 158);
+  --sidebar: oklch(0.955 0.014 87.5195);
+  --sidebar-foreground: oklch(0.235 0 0);
+  --sidebar-primary: oklch(0.3012 0 0);
+  --sidebar-primary-foreground: oklch(0.97 0.013 99.616);
+  --sidebar-accent: oklch(0.925 0.017 87.5);
+  --sidebar-accent-foreground: oklch(0.3012 0 0);
+  --sidebar-border: oklch(0.895 0.017 87.1621);
+
+  /* Status tones: text-strength color plus a soft tint for fills. */
+  --success: oklch(0.56 0.13 158);
+  --warning: oklch(0.6 0.14 65);
+  --danger: oklch(0.5771 0.2152 27.325);
+  --info: oklch(0.55 0.13 245);
+  --success-soft: color-mix(in oklch, var(--success) 12%, transparent);
+  --warning-soft: color-mix(in oklch, var(--warning) 13%, transparent);
+  --danger-soft: color-mix(in oklch, var(--danger) 10%, transparent);
+  --info-soft: color-mix(in oklch, var(--info) 11%, transparent);
+
+  --term: oklch(0.2264 0 0);
+  --term-foreground: oklch(0.9173 0.0133 82.4015);
+  --term-muted: oklch(0.6348 0.0113 81.7875);
+  --term-border: oklch(0.2931 0 0);
+  --term-success: oklch(0.78 0.14 158);
+  --term-danger: oklch(0.72 0.17 25);
+  --term-warning: oklch(0.83 0.13 80);
+  --term-accent: oklch(0.76 0.15 158);
+
+  --radius: 0.5rem;
+  --shadow-2xs: 0px 4px 10px 0px hsl(0 0% 0% / 0.05);
+  --shadow-xs: 0px 4px 10px 0px hsl(0 0% 0% / 0.05);
+  --shadow-sm: 0px 4px 10px 0px hsl(0 0% 0% / 0.1), 0px 1px 2px -1px hsl(0 0% 0% / 0.1);
+  --shadow-md: 0px 4px 10px 0px hsl(0 0% 0% / 0.1), 0px 2px 4px -1px hsl(0 0% 0% / 0.1);
+  --shadow-lg: 0px 4px 10px 0px hsl(0 0% 0% / 0.1), 0px 4px 6px -1px hsl(0 0% 0% / 0.1);
+  --shadow-xl: 0px 4px 10px 0px hsl(0 0% 0% / 0.1), 0px 8px 10px -1px hsl(0 0% 0% / 0.1);
+  --shadow-2xl: 0px 4px 10px 0px hsl(0 0% 0% / 0.25);
+  --tracking-normal: 0.01em;
+}
+
+.dark {
+  --background: oklch(0.1913 0 0);
+  --foreground: oklch(0.9173 0.0133 82.4015);
+  --card: oklch(0.2264 0 0);
+  --card-foreground: oklch(0.9173 0.0133 82.4015);
+  --popover: oklch(0.2264 0 0);
+  --popover-foreground: oklch(0.9173 0.0133 82.4015);
+  --primary: oklch(0.76 0.15 158);
+  --primary-foreground: oklch(0.22 0.05 158);
+  --secondary: oklch(0.252 0 0);
+  --secondary-foreground: oklch(0.852 0.0205 100.6306);
+  --muted: oklch(0.285 0 0);
+  --muted-foreground: oklch(0.6348 0.0113 81.7875);
+  --accent: oklch(0.3329 0 0);
+  --accent-foreground: oklch(0.852 0.0205 100.6306);
+  --destructive: oklch(0.6368 0.2078 25.3313);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.2931 0 0);
+  --input: oklch(0.2931 0 0);
+  --ring: oklch(0.76 0.15 158);
+  --sidebar: oklch(0.173 0 0);
+  --sidebar-foreground: oklch(0.9173 0.0133 82.4015);
+  --sidebar-primary: oklch(0.852 0.0205 100.6306);
+  --sidebar-primary-foreground: oklch(0.3329 0 0);
+  --sidebar-accent: oklch(0.2650 0 0);
+  --sidebar-accent-foreground: oklch(0.852 0.0205 100.6306);
+  --sidebar-border: oklch(0.2931 0 0);
+
+  --success: oklch(0.78 0.14 158);
+  --warning: oklch(0.83 0.13 80);
+  --danger: oklch(0.7 0.17 25);
+  --info: oklch(0.76 0.11 245);
+  --success-soft: color-mix(in oklch, var(--success) 13%, transparent);
+  --warning-soft: color-mix(in oklch, var(--warning) 12%, transparent);
+  --danger-soft: color-mix(in oklch, var(--danger) 13%, transparent);
+  --info-soft: color-mix(in oklch, var(--info) 12%, transparent);
+
+  --term: oklch(0.155 0 0);
+  --term-border: oklch(0.2931 0 0);
+
+  --shadow-2xs: 0px 6px 15px 0px hsl(0 0% 0% / 0.15);
+  --shadow-xs: 0px 6px 15px 0px hsl(0 0% 0% / 0.15);
+  --shadow-sm: 0px 6px 15px 0px hsl(0 0% 0% / 0.3), 0px 1px 2px -1px hsl(0 0% 0% / 0.3);
+  --shadow-md: 0px 6px 15px 0px hsl(0 0% 0% / 0.3), 0px 2px 4px -1px hsl(0 0% 0% / 0.3);
+  --shadow-lg: 0px 6px 15px 0px hsl(0 0% 0% / 0.3), 0px 4px 6px -1px hsl(0 0% 0% / 0.3);
+  --shadow-xl: 0px 6px 15px 0px hsl(0 0% 0% / 0.3), 0px 8px 10px -1px hsl(0 0% 0% / 0.3);
+  --shadow-2xl: 0px 6px 15px 0px hsl(0 0% 0% / 0.75);
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-term: var(--term);
+  --color-term-foreground: var(--term-foreground);
+  --color-term-muted: var(--term-muted);
+  --color-term-border: var(--term-border);
+  --color-term-success: var(--term-success);
+  --color-term-danger: var(--term-danger);
+  --color-term-warning: var(--term-warning);
+  --color-term-accent: var(--term-accent);
+
+  /* nimu-outreach type scale: negative tracking on display, eased to zero at body. */
+  --text-display-md: 2.5rem;
+  --text-display-md--line-height: 1.15;
+  --text-display-md--letter-spacing: -0.025em;
+  --text-display-md--font-weight: 600;
+
+  --text-headline: 1.75rem;
+  --text-headline--line-height: 1.2;
+  --text-headline--letter-spacing: -0.0214em;
+  --text-headline--font-weight: 600;
+
+  --text-card-title: 1.375rem;
+  --text-card-title--line-height: 1.25;
+  --text-card-title--letter-spacing: -0.0182em;
+  --text-card-title--font-weight: 500;
+
+  --text-eyebrow: 0.8125rem;
+  --text-eyebrow--line-height: 1.3;
+  --text-eyebrow--letter-spacing: 0.0308em;
+  --text-eyebrow--font-weight: 500;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --shadow-2xs: var(--shadow-2xs);
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+  --shadow-2xl: var(--shadow-2xl);
+
+  --tracking-tight: calc(var(--tracking-normal) - 0.025em);
+  --tracking-normal: var(--tracking-normal);
+  --tracking-wide: calc(var(--tracking-normal) + 0.025em);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background font-sans text-foreground;
+    letter-spacing: var(--tracking-normal);
+    font-feature-settings: "kern" 1, "liga" 1, "calt" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 30%, transparent);
+  }
+}
+
+/* Themed scrollbars, as in nimu-outreach. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+  background-clip: padding-box;
+}
+
+@utility no-scrollbar {
+  &::-webkit-scrollbar {
+    display: none;
+  }
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in oklch, currentColor 45%, transparent); }
+  100% { box-shadow: 0 0 0 6px transparent; }
+}
+.live-dot {
+  animation: pulse-ring 1.6s ease-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot { animation: none; }
+}
