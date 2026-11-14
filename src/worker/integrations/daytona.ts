@@ -63,6 +63,11 @@ export class Sandbox {
     throw new Error("Sandbox did not start within 3 minutes");
   }
 
+  /** A URL for one port with the access token embedded: no headers needed, expires, can't reach other ports. */
+  async signedPreviewUrl(port: number, expiresInSeconds: number): Promise<{ url: string; token: string }> {
+    return Sandbox.api<{ url: string; token: string }>(this.env, `/sandbox/${this.id}/ports/${port}/signed-preview-url?expiresInSeconds=${expiresInSeconds}`);
+  }
+
   async delete(): Promise<void> {
     await Sandbox.api(this.env, `/sandbox/${this.id}`, { method: "DELETE" }).catch(() => undefined);
   }

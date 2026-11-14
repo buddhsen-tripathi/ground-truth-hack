@@ -112,6 +112,17 @@ export interface RunAttempt {
   summary: string;
 }
 
+/** Live preview of the patched app, served from the run's sandbox after checks pass. */
+export interface RunPreview {
+  state: "starting" | "live" | "unavailable" | "ended";
+  /** Signed, single-port Daytona URL; only set while the preview is live. */
+  url?: string;
+  command?: string;
+  port?: number;
+  expiresAt?: string;
+  note?: string;
+}
+
 export interface RunResult {
   attempts: RunAttempt[];
   diff: string;
@@ -120,6 +131,7 @@ export interface RunResult {
   testCommand: string | null;
   durationMs: number;
   error?: string;
+  preview?: RunPreview;
 }
 
 export interface Run {
@@ -144,7 +156,8 @@ export type RunEvent =
   | { t: number; type: "cmd"; command: string }
   | { t: number; type: "exit"; command: string; exitCode: number | null; ms: number }
   | { t: number; type: "agent"; text: string }
-  | { t: number; type: "status"; status: RunStatus; step: RunStep };
+  | { t: number; type: "status"; status: RunStatus; step: RunStep }
+  | { t: number; type: "preview"; preview: RunPreview };
 
 export interface WatchStatus {
   lastRun: { at: string; trigger: string; osvChecked: number; newsChecked: number; newIncidents: number; errors: string[] } | null;

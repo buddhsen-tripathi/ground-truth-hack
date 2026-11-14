@@ -194,6 +194,12 @@ app.post("/runs/:id/pr", async (c) => {
   return c.json(await res.json(), res.status as 200 | 500);
 });
 
+app.post("/runs/:id/preview/stop", async (c) => {
+  const stub = c.env.FIX_RUN.get(c.env.FIX_RUN.idFromName(c.req.param("id")));
+  const res = await stub.fetch("https://run/preview/stop", { method: "POST" });
+  return c.json(await res.json(), res.status as 200 | 500);
+});
+
 app.get("/health", (c) => c.json({ ok: true }));
 
 export default {

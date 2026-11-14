@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { FixPlan, Incident, RunAttempt, RunEvent, RunEventInput, RunResult, RunStatus, RunStep, Source } from "@shared/types";
+import type { FixPlan, Incident, RunAttempt, RunEvent, RunEventInput, RunPreview, RunResult, RunStatus, RunStep, Source } from "@shared/types";
 import { now, type AppEnv } from "../env";
 import { chat, parseJsonReply } from "../integrations/clonvo";
 import { Sandbox } from "../integrations/daytona";
@@ -14,8 +14,13 @@ const SESSION = "firebreak";
 const MAX_REPAIRS = 3;
 const INSTALL_TIMEOUT = 600;
 const TEST_TIMEOUT = 600;
+/** The patched app is served on this port inside the sandbox. */
+const PREVIEW_PORT = 3000;
+/** How long the sandbox stays up for the live preview after a verified fix. */
+const PREVIEW_TTL_SEC = 30 * 60;
+const PREVIEW_BOOT_SEC = 120;
 
-type Phase = "sandbox" | "clone" | "patch" | "install" | "verify" | "test" | "repair" | "ready" | "done";
+type Phase = "sandbox" | "clone" | "patch" | "install" | "verify" | "test" | "repair" | "preview" | "previewing" | "ready" | "done";
 
 export interface StartRun {
   runId: string;
@@ -36,6 +41,8 @@ interface State extends StartRun {
   yarnBerry?: boolean;
   testCommand: string | null;
   attempts: RunAttempt[];
+  /** Start to verified fix; the run's clock stops here even while a preview stays up. */
+  verifiedMs?: number;
   lastFailure?: string;
   repairs: number;
   lockfileClean: boolean | null;
@@ -45,6 +52,7 @@ interface State extends StartRun {
   migrationSources: Source[];
   error?: string;
   prUrl?: string;
+  preview?: RunPreview;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -123,8 +131,9 @@ export class FixRun extends DurableObject<AppEnv> {
       changedFiles: s.changedFiles,
       lockfileClean: s.lockfileClean,
       testCommand: s.testCommand,
-      durationMs: Date.now() - s.startedAt,
+      durationMs: s.verifiedMs ?? Date.now() - s.startedAt,
       error: s.error,
+      preview: s.preview,
     };
   }
 
@@ -137,10 +146,22 @@ export class FixRun extends DurableObject<AppEnv> {
     }
     this.emit({ type: "status", status, step: s.step });
     await this.save();
-    const finished = status === "passed" || status === "failed" || status === "pr_opened";
+    await this.mirror(s);
+  }
+
+  /** Copies the run's state to its D1 row, which the list and detail APIs read. */
+  private async mirror(s: State): Promise<void> {
+    const finished = s.status === "passed" || s.status === "failed" || s.status === "pr_opened";
     await this.env.DB.prepare("UPDATE runs SET status = ?, step = ?, result = ?, pr_url = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?")
-      .bind(status, s.step, JSON.stringify(this.result(s)), s.prUrl ?? null, finished ? now() : null, s.runId)
+      .bind(s.status, s.step, JSON.stringify(this.result(s)), s.prUrl ?? null, finished ? now() : null, s.runId)
       .run();
+  }
+
+  private async setPreview(s: State, preview: RunPreview): Promise<void> {
+    s.preview = preview;
+    await this.save();
+    this.emit({ type: "preview", preview });
+    await this.mirror(s);
   }
 
   private async step(step: RunStep): Promise<void> {
@@ -188,6 +209,15 @@ export class FixRun extends DurableObject<AppEnv> {
       await this.ctx.storage.setAlarm(Date.now());
       return Response.json({ ok: true });
     }
+    if (req.method === "POST" && url.pathname.endsWith("/preview/stop")) {
+      const s = await this.load();
+      if (s.phase === "preview" || s.phase === "previewing") {
+        await this.endPreview(s, "Preview stopped and the sandbox deleted.");
+        s.phase = "ready";
+        await this.save();
+      }
+      return Response.json({ ok: true });
+    }
     if (req.method === "POST" && url.pathname.endsWith("/pr")) {
       try {
         return Response.json({ url: await this.openPr() });
@@ -210,12 +240,22 @@ export class FixRun extends DurableObject<AppEnv> {
 
   override async alarm(): Promise<void> {
     const s = await this.load();
+    if (s.phase === "previewing") {
+      const until = Date.parse(s.preview?.expiresAt ?? "") || 0;
+      if (Date.now() >= until - 1000) {
+        await this.endPreview(s, "Preview expired and the sandbox was deleted.");
+        s.phase = "ready";
+        await this.save();
+      } else await this.ctx.storage.setAlarm(until);
+      return;
+    }
     if (s.phase === "done" || s.phase === "ready") return;
     try {
       const next = await this.runPhase(s);
       s.phase = next;
       await this.save();
-      if (next !== "done" && next !== "ready") await this.ctx.storage.setAlarm(Date.now());
+      if (next === "previewing") await this.ctx.storage.setAlarm(Date.parse(s.preview?.expiresAt ?? "") || Date.now() + PREVIEW_TTL_SEC * 1000);
+      else if (next !== "done" && next !== "ready") await this.ctx.storage.setAlarm(Date.now());
     } catch (e) {
       await this.fail((e as Error).message);
     }
@@ -445,6 +485,16 @@ export class FixRun extends DurableObject<AppEnv> {
         return "test";
       }
 
+      case "preview": {
+        // Best effort: the fix is already verified, so a preview that won't start never fails the run.
+        try {
+          return await this.startPreview(s);
+        } catch (e) {
+          await this.endPreview(s, `No live preview: ${(e as Error).message.slice(0, 300)}`, "unavailable");
+          return "ready";
+        }
+      }
+
       default:
         return "done";
     }
@@ -549,13 +599,79 @@ export class FixRun extends DurableObject<AppEnv> {
       const content = await sb.readFile(this.repoPath(s, path));
       if (content !== null) this.storeFile(path, content);
     }
+    s.verifiedMs = Date.now() - s.startedAt;
     await this.save();
     await this.setStatus("passed", "ready");
-    await sb.delete().catch(() => undefined);
-    s.sandboxId = undefined;
-    await this.save();
-    this.info("Fix verified and the sandbox deleted. Review the receipt, then open the PR when you're ready.");
-    return "ready";
+    this.info("Fix verified. Review the receipt, then open the PR when you're ready. Starting a live preview of the patched app…");
+    return "preview";
+  }
+
+  // ── live preview (after a verified fix) ───────────────────────────────────────────────────────────
+
+  /** Picks the script that serves the app and adds flags so it listens on PREVIEW_PORT on every interface. */
+  private async previewCommand(sb: Sandbox, s: State): Promise<string | null> {
+    const p = s.plan;
+    const raw = await sb.readFile(this.dirPath(s, "package.json"));
+    const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
+    const name = ["dev", "start", "preview"].find((n) => scripts[n] && !/^\s*(echo|exit)\b/.test(scripts[n]!));
+    if (!name) return null;
+    const script = scripts[name]!;
+    const run = p.manager === "npm" ? `npm run ${name} --` : `${p.manager} run ${name}`;
+    const port = String(PREVIEW_PORT);
+    if (/\bnext\b/.test(script)) return `${run} -H 0.0.0.0 -p ${port}`;
+    if (/\b(vite|astro|react-router|remix|nuxt|svelte-kit|vinext)\b/.test(script) && !/\bvitest\b/.test(script)) return `${run} --host 0.0.0.0 --port ${port}`;
+    if (/\bwrangler\b/.test(script)) return `${run} --ip 0.0.0.0 --port ${port}`;
+    return `${p.manager === "npm" ? `npm run ${name}` : `${p.manager} run ${name}`}`;
+  }
+
+  private async startPreview(s: State): Promise<Phase> {
+    const sb = await this.sandbox(s);
+    const command = await this.previewCommand(sb, s);
+    if (!command) {
+      await this.endPreview(s, "No dev, start or preview script in package.json, so there is nothing to serve.", "unavailable");
+      return "ready";
+    }
+    await this.setPreview(s, { state: "starting", command, port: PREVIEW_PORT });
+    const signed = await sb.signedPreviewUrl(PREVIEW_PORT, PREVIEW_TTL_SEC);
+    const host = new URL(signed.url).hostname;
+    // Vite refuses unknown Host headers in dev; allow the preview proxy's domain.
+    const allowed = host.includes(".") ? host.slice(host.indexOf(".")) : host;
+    this.emit({ type: "cmd", command });
+    await sb.startCommand(
+      SESSION,
+      `cd ${this.dirPath(s)} && PORT=${PREVIEW_PORT} HOST=0.0.0.0 HOSTNAME=0.0.0.0 BROWSER=none __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${allowed} nohup ${command} > /tmp/fb-preview.log 2>&1 &`,
+    );
+    const started = Date.now();
+    let up = false;
+    while (Date.now() - started < PREVIEW_BOOT_SEC * 1000) {
+      await sleep(3000);
+      const probe = await sb
+        .exec(`node -e "fetch('http://127.0.0.1:${PREVIEW_PORT}/').then(r=>console.log(r.status)).catch(()=>console.log(0))"`, { timeoutSec: 15 })
+        .catch(() => ({ exitCode: 1, output: "0" }));
+      if (Number(probe.output.trim().split("\n").pop()) > 0) {
+        up = true;
+        break;
+      }
+    }
+    const log = (await sb.exec("tail -c 3000 /tmp/fb-preview.log").catch(() => ({ exitCode: 1, output: "" }))).output;
+    if (log.trim()) this.emit({ type: "log", stream: "out", text: log });
+    if (!up) throw new Error(`the app did not answer on port ${PREVIEW_PORT} within ${PREVIEW_BOOT_SEC}s`);
+    this.emit({ type: "exit", command, exitCode: 0, ms: Date.now() - started });
+    const expiresAt = new Date(Date.now() + PREVIEW_TTL_SEC * 1000).toISOString();
+    await this.setPreview(s, { state: "live", url: signed.url, command, port: PREVIEW_PORT, expiresAt });
+    this.info(`Live preview is up for ${PREVIEW_TTL_SEC / 60} minutes. The sandbox is deleted when it expires.`);
+    return "previewing";
+  }
+
+  /** Deletes the sandbox and records why the preview isn't (or is no longer) available. */
+  private async endPreview(s: State, note: string, state: RunPreview["state"] = "ended"): Promise<void> {
+    if (s.sandboxId) {
+      const sb = await Sandbox.attach(this.env, s.sandboxId).catch(() => null);
+      await sb?.delete().catch(() => undefined);
+      s.sandboxId = undefined;
+    }
+    this.info(note);
+    await this.setPreview(s, { ...s.preview, state, url: undefined, expiresAt: undefined, note });
   }
 
   // ── PR (only when the user clicks) ────────────────────────────────────────────────────────────────
@@ -591,7 +707,8 @@ export class FixRun extends DurableObject<AppEnv> {
     await this.save();
     this.emit({ type: "agent", text: `Pull request opened: ${url}` });
     await this.setStatus("pr_opened", "ready");
-    if (s.sandboxId) {
+    // A live preview keeps its sandbox until it expires or is stopped.
+    if (s.sandboxId && s.phase !== "preview" && s.phase !== "previewing") {
       const sb = await Sandbox.attach(this.env, s.sandboxId).catch(() => null);
       await sb?.delete().catch(() => undefined);
       s.sandboxId = undefined;
