@@ -30,7 +30,7 @@
     {
       "binding": "DB",
       "database_name": "firebreak",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "5fd4549a-f441-49cb-9f1b-de2e9653a899",
       "migrations_dir": "migrations"
     }
   ],
