@@ -74,3 +74,93 @@ for (const e of a.edits) {
 }
 console.log(JSON.stringify(report));
 `;
+
+/**
+ * Python version of PATCH_PACKAGE_JSON. For uv projects it edits requirement strings in every pyproject.toml under the
+ * project only when their specifier excludes the target (otherwise `uv lock -P name==to` pins it), and adds packages
+ * nothing declares to [tool.uv] constraint-dependencies. For pinned requirements files it rewrites the `==` pins, or
+ * reports the .in file to recompile from when the file is pip-compile output. Prints a JSON report.
+ */
+export const PATCH_PYTHON = String.raw`
+import json, os, re, sys
+a = json.load(open(sys.argv[1]))
+def norm(n): return re.sub(r"[-_.]+", "-", n).lower()
+try:
+    from packaging.specifiers import SpecifierSet
+except Exception:
+    try:
+        from pip._vendor.packaging.specifiers import SpecifierSet
+    except Exception:
+        SpecifierSet = None
+def allows(spec, version):
+    if not spec.strip(): return True
+    if SpecifierSet is None: return False
+    try: return SpecifierSet(spec.replace(" ", "")).contains(version, prereleases=True)
+    except Exception: return False
+report = {"changed": [], "compile": None, "error": None}
+root = a["root"]
+pkgs = {norm(p["name"]): p for p in a["packages"]}
+rel = lambda f: os.path.relpath(f, a["repo"])
+
+if a["manager"] == "uv":
+    files = []
+    for d, dirs, fs in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "venv", "__pycache__")]
+        if d[len(root):].count(os.sep) >= 4: dirs[:] = []
+        if "pyproject.toml" in fs: files.append(os.path.join(d, "pyproject.toml"))
+    declared = set()
+    pat = re.compile(r"""(?P<pre>(?:^|[\[,])\s*)(?P<q>["'])(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\s*\[[^\]]*\])?(?P<spec>[^;"'\[\]]*)(?P<marker>;[^"']*)?(?P=q)""", re.M)
+    for f in files:
+        text = open(f).read()
+        def sub(m):
+            p = pkgs.get(norm(m.group("name")))
+            if not p: return m.group(0)
+            spec = m.group("spec").strip()
+            if spec.startswith("@"): return m.group(0)
+            declared.add(norm(m.group("name")))
+            if allows(spec, p["to"]): return m.group(0)
+            new = ("==" if p["exact"] else ">=") + p["to"]
+            report["changed"].append(rel(f) + ": " + m.group("name") + " " + (spec or "(any)") + " -> " + new)
+            return m.group("pre") + m.group("q") + m.group("name") + (m.group("extras") or "") + new + (m.group("marker") or "") + m.group("q")
+        out = pat.sub(sub, text)
+        if out != text: open(f, "w").write(out)
+    need = [p for n, p in pkgs.items() if n not in declared]
+    if need:
+        f = os.path.join(root, "pyproject.toml")
+        text = open(f).read()
+        items = ['"' + p["name"] + ("==" if p["exact"] else ">=") + p["to"] + '"' for p in need]
+        table = re.search(r"^\[tool\.uv\][ \t]*$", text, re.M)
+        nxt = re.search(r"^\[", text[table.end():], re.M) if table else None
+        end = table.end() + nxt.start() if nxt else len(text)
+        key = re.search(r"^constraint-dependencies\s*=\s*\[", text[table.end():end], re.M) if table else None
+        if key:
+            at = table.end() + key.end()
+            text = text[:at] + " " + ", ".join(items) + "," + text[at:]
+        elif table:
+            text = text[:table.end()] + "\nconstraint-dependencies = [" + ", ".join(items) + "]" + text[table.end():]
+        else:
+            text = text.rstrip("\n") + "\n\n[tool.uv]\nconstraint-dependencies = [" + ", ".join(items) + "]\n"
+        open(f, "w").write(text)
+        report["changed"].append(rel(f) + ": [tool.uv] constraint-dependencies += " + ", ".join(items))
+else:
+    req = a["file"]
+    text = open(req).read()
+    hashes = "--hash" in text
+    infile = os.path.splitext(req)[0] + ".in"
+    compiled = re.search(r"(uv pip compile|pip-compile)", text[:3000]) is not None
+    if os.path.exists(infile) and (hashes or compiled):
+        report["compile"] = {"in": infile, "hashes": hashes}
+    elif hashes:
+        report["error"] = rel(req) + " pins hashes but has no .in file to regenerate them from"
+    else:
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            m = re.match(r"^(\s*)([A-Za-z0-9][A-Za-z0-9._-]*)(\s*\[[^\]]*\])?\s*===?\s*([^\s;#\\]+)(.*)$", line)
+            if not m: continue
+            p = pkgs.get(norm(m.group(2)))
+            if not p: continue
+            lines[i] = m.group(1) + m.group(2) + (m.group(3) or "") + "==" + p["to"] + m.group(5)
+            report["changed"].append(rel(req) + ": " + m.group(2) + "==" + m.group(4) + " -> ==" + p["to"])
+        open(req, "w").write("\n".join(lines))
+print(json.dumps(report))
+`;

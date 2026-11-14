@@ -1,4 +1,4 @@
-import type { Exposure, Incident, Repo, Run, RunStatus, RunStep } from "@shared/types";
+import type { Exposure, FixPlan, Incident, Manager, Repo, Run, RunStatus, RunStep } from "@shared/types";
 import type { AppEnv } from "./env";
 
 const json = <T>(s: unknown, fallback: T): T => {
@@ -62,17 +62,48 @@ export function rowToExposure(r: Row): Exposure {
   };
 }
 
+interface LegacyPlan {
+  strategy: "upgrade" | "pin-back" | "override";
+  package: string;
+  from: string;
+  to: string;
+  manager: Manager;
+  lockfile: string;
+  dir: string;
+  direct: boolean;
+  reason: string;
+}
+
+/** Runs started before repo-level fixes stored a single-package plan; read them as a one-package repo plan. */
+export function normalizePlan(plan: unknown): FixPlan | null {
+  if (!plan || typeof plan !== "object") return null;
+  if ("targets" in plan) return plan as FixPlan;
+  const p = plan as LegacyPlan;
+  return {
+    targets: [
+      {
+        lockfile: p.lockfile,
+        dir: p.dir,
+        manager: p.manager,
+        ecosystem: "npm",
+        packages: [
+          { key: `${p.lockfile}::${p.package}`, package: p.package, from: [p.from], to: p.to, strategy: p.strategy, direct: p.direct, exact: p.strategy === "pin-back", incidents: [], reason: p.reason },
+        ],
+      },
+    ],
+    skipped: [],
+  };
+}
+
 export function rowToRun(r: Row): Run {
   return {
     id: r.id as string,
-    incidentId: r.incident_id as string,
     repoId: r.repo_id as string,
     repoFullName: (r.full_name as string) ?? "",
-    incidentTitle: (r.title as string) ?? "",
-    package: (r.package as string) ?? "",
+    incidentIds: json<(string | null)[]>(r.incident_ids, []).filter((x): x is string => !!x),
     status: r.status as RunStatus,
     step: r.step as RunStep,
-    plan: json(r.plan, null),
+    plan: normalizePlan(json(r.plan, null)),
     result: json(r.result, null),
     prUrl: (r.pr_url as string) ?? null,
     startedAt: r.started_at as string,
@@ -82,7 +113,7 @@ export function rowToRun(r: Row): Run {
 
 export const INCIDENT_SELECT = `SELECT i.*, (SELECT COUNT(DISTINCT repo_id) FROM exposures e WHERE e.incident_id = i.id) AS exposure_count FROM incidents i`;
 export const REPO_SELECT = `SELECT r.*, (SELECT COUNT(DISTINCT incident_id) FROM exposures e WHERE e.repo_id = r.id) AS exposure_count FROM repos r`;
-export const RUN_SELECT = `SELECT ru.*, r.full_name, i.title, i.package FROM runs ru JOIN repos r ON r.id = ru.repo_id JOIN incidents i ON i.id = ru.incident_id`;
+export const RUN_SELECT = `SELECT ru.*, r.full_name, (SELECT json_group_array(ri.incident_id) FROM run_incidents ri WHERE ri.run_id = ru.id) AS incident_ids FROM runs ru JOIN repos r ON r.id = ru.repo_id`;
 
 export async function getIncident(env: AppEnv, id: string): Promise<Incident | null> {
   const row = await env.DB.prepare(`${INCIDENT_SELECT} WHERE i.id = ?`).bind(id).first();

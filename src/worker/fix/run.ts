@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import type { FixPlan, Incident, RunAttempt, RunEvent, RunEventInput, RunPreview, RunResult, RunStatus, RunStep, Source } from "@shared/types";
+import { planPackages, type FixPlan, type Incident, type LockfileFix, type RunAttempt, type RunEvent, type RunEventInput, type RunPreview, type RunResult, type RunStatus, type RunStep, type Source } from "@shared/types";
 import { now, type AppEnv } from "../env";
+import { normalizePlan } from "../db";
 import { chat, parseJsonReply } from "../integrations/clonvo";
 import { Sandbox } from "../integrations/daytona";
 import { openPullRequest } from "../integrations/github";
@@ -8,7 +9,7 @@ import { search } from "../integrations/you";
 import { parseLockfile } from "../lockfiles";
 import { parseDocument } from "yaml";
 import { isAffected } from "../versions";
-import { APPLY_EDITS, PATCH_PACKAGE_JSON } from "./scripts";
+import { APPLY_EDITS, PATCH_PACKAGE_JSON, PATCH_PYTHON } from "./scripts";
 
 const SESSION = "firebreak";
 const MAX_REPAIRS = 3;
@@ -26,8 +27,16 @@ export interface StartRun {
   runId: string;
   fullName: string;
   defaultBranch: string;
-  incident: Pick<Incident, "id" | "kind" | "title" | "package" | "affected" | "sources" | "severity">;
   plan: FixPlan;
+  /** Every advisory the run clears (for the receipt and PR). */
+  incidents: Pick<Incident, "id" | "kind" | "title" | "severity" | "sources">[];
+  /** "<ecosystem>:<package>" → affected sets of every known advisory for it; the lockfile check rejects all of them. */
+  avoid: Record<string, Incident["affected"][]>;
+}
+
+/** State saved by runs started before repo-level fixes. */
+interface LegacyStart {
+  incident?: Pick<Incident, "id" | "kind" | "title" | "package" | "affected" | "sources" | "severity">;
 }
 
 interface State extends StartRun {
@@ -38,8 +47,15 @@ interface State extends StartRun {
   sandboxId?: string;
   /** Home directory of the sandbox user; the repo is cloned to <home>/repo. */
   home?: string;
-  yarnBerry?: boolean;
-  testCommand: string | null;
+  /** Lockfile path → yarn berry (true) or classic. */
+  yarnBerry: Record<string, boolean>;
+  /** Index into plan.targets for the phases that work one lockfile per alarm (install, test, repair). */
+  cursor: number;
+  /** Lockfile path → check command picked for its project. */
+  tests: Record<string, string>;
+  /** Requirements file → the .in file it's recompiled from (pip-compile output). */
+  pyCompile: Record<string, { in: string; hashes: boolean } | null>;
+  uvReady?: boolean;
   attempts: RunAttempt[];
   /** Start to verified fix; the run's clock stops here even while a preview stays up. */
   verifiedMs?: number;
@@ -95,7 +111,21 @@ export class FixRun extends DurableObject<AppEnv> {
   // ── storage, events, D1 mirror ────────────────────────────────────────────────────────────────────
 
   private async load(): Promise<State> {
-    if (!this.st) this.st = (await this.ctx.storage.get<State>("state")) ?? null;
+    if (!this.st) {
+      const raw = (await this.ctx.storage.get<State & LegacyStart & { testCommand?: string | null }>("state")) ?? null;
+      if (raw && !("targets" in (raw.plan ?? {}))) {
+        // A single-package run from before repo-level fixes: read it in the new shape.
+        const i = raw.incident;
+        raw.plan = normalizePlan(raw.plan)!;
+        raw.incidents = i ? [i] : [];
+        raw.avoid = i ? { [`npm:${i.package}`]: [i.affected] } : {};
+        raw.tests = raw.testCommand ? { [raw.plan.targets[0]!.lockfile]: raw.testCommand } : {};
+        raw.yarnBerry ??= {};
+        raw.pyCompile ??= {};
+        raw.cursor ??= 0;
+      }
+      this.st = raw;
+    }
     if (!this.st) throw new Error("Run not started");
     return this.st;
   }
@@ -130,7 +160,7 @@ export class FixRun extends DurableObject<AppEnv> {
       diff: s.diff,
       changedFiles: s.changedFiles,
       lockfileClean: s.lockfileClean,
-      testCommand: s.testCommand,
+      testCommand: Object.values(s.tests).join(" · ") || null,
       durationMs: s.verifiedMs ?? Date.now() - s.startedAt,
       error: s.error,
       preview: s.preview,
@@ -192,7 +222,10 @@ export class FixRun extends DurableObject<AppEnv> {
         status: "queued",
         step: "plan",
         startedAt: Date.now(),
-        testCommand: null,
+        yarnBerry: {},
+        cursor: 0,
+        tests: {},
+        pyCompile: {},
         attempts: [],
         repairs: 0,
         lockfileClean: null,
@@ -203,9 +236,12 @@ export class FixRun extends DurableObject<AppEnv> {
       };
       await this.save();
       this.emit({ type: "step", step: "plan", label: STEP_LABELS.plan });
-      const p = start.plan;
-      this.info(`${p.strategy === "pin-back" ? "Pin back" : p.strategy === "override" ? "Override" : "Upgrade"} ${p.package} ${p.from} → ${p.to} in ${p.lockfile} (${p.manager}).`);
-      this.info(p.reason);
+      const all = planPackages(start.plan);
+      this.info(`${all.length} package${all.length === 1 ? "" : "s"} across ${start.plan.targets.length} lockfile${start.plan.targets.length === 1 ? "" : "s"}, clearing ${start.incidents.length} advisor${start.incidents.length === 1 ? "y" : "ies"}.`);
+      for (const p of all) {
+        const verb = p.strategy === "pin-back" ? "Pin back" : p.strategy === "override" ? "Override" : "Upgrade";
+        this.info(`${verb} ${p.package} ${p.from.join(", ")} → ${p.to} in ${p.lockfile} (${p.manager}). ${p.reason}`);
+      }
       await this.ctx.storage.setAlarm(Date.now());
       return Response.json({ ok: true });
     }
@@ -317,12 +353,29 @@ export class FixRun extends DurableObject<AppEnv> {
     return `${s.home ?? "/home/daytona"}/repo${rel ? `/${rel}` : ""}`;
   }
 
-  private dirPath(s: State, file = "") {
-    return this.repoPath(s, [s.plan.dir, file].filter(Boolean).join("/"));
+  /** Absolute path inside a lockfile's project directory. */
+  private dirPath(s: State, t: LockfileFix, file = "") {
+    return this.repoPath(s, [t.dir, file].filter(Boolean).join("/"));
+  }
+
+  private target(s: State): LockfileFix {
+    const t = s.plan.targets[s.cursor];
+    if (!t) throw new Error("No lockfile left to work on");
+    return t;
+  }
+
+  /** Each Python project gets its own virtualenv outside the repo, so it never shows up in the diff. */
+  private venv(s: State, t: LockfileFix) {
+    return `/tmp/fb-venv-${s.plan.targets.indexOf(t)}`;
+  }
+
+  private uv(s: State, t: LockfileFix, args: string) {
+    return `UV_PROJECT_ENVIRONMENT=${this.venv(s, t)} uv ${args}`;
   }
 
   private async runPhase(s: State): Promise<Phase> {
-    const p = s.plan;
+    const targets = s.plan.targets;
+    const python = targets.some((t) => t.ecosystem === "PyPI");
     switch (s.phase) {
       case "sandbox": {
         await this.step("sandbox");
@@ -334,12 +387,8 @@ export class FixRun extends DurableObject<AppEnv> {
         s.home = (await sb.exec("echo $HOME")).output.trim() || "/home/daytona";
         await this.save();
         await sb.createSession(SESSION);
-        await this.run(
-          sb,
-          `export CI=true COREPACK_ENABLE_DOWNLOAD_PROMPT=0 PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"; node -v && npm -v && git --version`,
-          60,
-          "node -v && npm -v && git --version",
-        );
+        const versions = `node -v && npm -v && git --version${python ? " && python3 --version" : ""}`;
+        await this.run(sb, `export CI=true COREPACK_ENABLE_DOWNLOAD_PROMPT=0 UV_NO_PROGRESS=1 PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"; ${versions}`, 60, versions);
         return "clone";
       }
 
@@ -360,117 +409,68 @@ export class FixRun extends DurableObject<AppEnv> {
         }
         // The token was only needed for the clone; strip it from the remote before any project code runs.
         await this.run(sb, `cd ${this.repoPath(s)} && git remote set-url origin https://github.com/${s.fullName}.git && git log -1 --oneline`, 60);
-        if (p.manager === "yarn") s.yarnBerry = (await sb.exec(`grep -q __metadata ${this.repoPath(s, p.lockfile)}`)).exitCode === 0;
+        for (const t of targets)
+          if (t.manager === "yarn") s.yarnBerry[t.lockfile] = (await sb.exec(`grep -q __metadata ${this.repoPath(s, t.lockfile)}`)).exitCode === 0;
         return "patch";
       }
 
       case "patch": {
         await this.step("patch");
         const sb = await this.sandbox(s);
-        let pnpmMajor = 0;
-        if (p.manager !== "npm") {
-          const tool = p.manager === "bun" ? "bun" : p.manager;
-          const ensure =
-            p.manager === "bun"
-              ? `command -v bun || (curl -fsSL https://bun.sh/install | bash) || npm i -g --prefix ~/.local bun`
-              : `command -v ${tool} || (mkdir -p ~/.local/bin && corepack enable --install-directory ~/.local/bin) || npm i -g --prefix ~/.local ${tool}`;
-          const r = await this.run(sb, `cd ${this.dirPath(s)} && (${ensure}) >/dev/null 2>&1; ${tool} --version`, 180);
-          if (r.exitCode !== 0) throw new Error(`Could not set up ${tool} in the sandbox`);
-          if (p.manager === "pnpm") pnpmMajor = Number(/(\d+)\.\d+\.\d+\s*$/.exec(r.output.trim())?.[1] ?? 0);
+        for (const t of targets) {
+          if (t.ecosystem === "PyPI") await this.patchPython(sb, s, t);
+          else await this.patchNpm(sb, s, t);
         }
-        const exact = s.incident.kind === "malicious" || p.strategy === "pin-back";
-        await sb.writeFile("/tmp/fb-patch.cjs", PATCH_PACKAGE_JSON);
-        await sb.writeFile(
-          "/tmp/fb-patch.json",
-          JSON.stringify({ root: this.dirPath(s), name: p.package, to: p.to, manager: p.manager, strategy: p.strategy, exact, pnpmMajor }),
-        );
-        // Short and output-critical, so it runs through the synchronous exec rather than the streamed session.
-        this.emit({ type: "cmd", command: "patch package.json" });
-        const r = await sb.exec("node /tmp/fb-patch.cjs /tmp/fb-patch.json", { timeoutSec: 60 });
-        this.emit({ type: "exit", command: "patch package.json", exitCode: r.exitCode, ms: 0 });
-        if (r.exitCode !== 0) throw new Error(`Could not edit package.json: ${r.output.slice(-500)}`);
-        const report = JSON.parse(r.output.trim().split("\n").pop() ?? "{}") as { changed: string[]; catalogs: { file: string; catalog: string }[]; overrideNeeded: boolean };
-
-        // pnpm catalogs and pnpm >= 10 overrides live in pnpm-workspace.yaml.
-        if (report.catalogs.length || report.overrideNeeded) {
-          const file = this.dirPath(s, "pnpm-workspace.yaml");
-          const doc = parseDocument((await sb.readFile(file)) ?? "");
-          const spec = exact ? p.to : `^${p.to}`;
-          for (const c of new Set(report.catalogs.map((x) => x.catalog))) {
-            const key = c === "default" && doc.hasIn(["catalog", p.package]) ? ["catalog", p.package] : ["catalogs", c, p.package];
-            doc.setIn(key, spec);
-            report.changed.push(`pnpm-workspace.yaml ${key.join(".")} = ${spec}`);
-          }
-          if (report.overrideNeeded) {
-            doc.setIn(["overrides", p.package], p.to);
-            report.changed.push(`pnpm-workspace.yaml overrides.${p.package} = ${p.to}`);
-          }
-          await sb.writeFile(file, doc.toString());
-        }
-        if (!report.changed.length) throw new Error(`Nothing in the repo declares ${p.package} in a form Firebreak can edit`);
-        this.info(report.changed.join("\n"));
+        s.cursor = 0;
         return "install";
       }
 
       case "install": {
         await this.step("install");
         const sb = await this.sandbox(s);
-        const cmd =
-          p.manager === "npm"
-            ? "npm install --ignore-scripts --no-audit --no-fund"
-            : p.manager === "pnpm"
-              ? "pnpm install --ignore-scripts --no-frozen-lockfile"
-              : p.manager === "yarn"
-                ? s.yarnBerry
-                  ? "YARN_ENABLE_IMMUTABLE_INSTALLS=false yarn install --mode=skip-build"
-                  : "yarn install --ignore-scripts --non-interactive --no-frozen-lockfile"
-                : "bun install --ignore-scripts";
-        let r = await this.run(sb, `cd ${this.dirPath(s)} && ${cmd}`, INSTALL_TIMEOUT);
-        if (r.exitCode !== 0 && p.manager === "npm" && /ERESOLVE|peer dep/i.test(r.output)) {
-          this.info("Peer dependency conflict; retrying with --legacy-peer-deps.");
-          r = await this.run(sb, `cd ${this.dirPath(s)} && ${cmd} --legacy-peer-deps`, INSTALL_TIMEOUT);
-        }
-        if (r.exitCode !== 0) throw new Error(`Install failed (exit ${r.exitCode ?? "timeout"})`);
+        const t = this.target(s);
+        if (t.ecosystem === "PyPI") await this.installPython(sb, s, t);
+        else await this.installNpm(sb, s, t);
+        s.cursor++;
+        if (s.cursor < targets.length) return "install";
+        s.cursor = 0;
         return "verify";
       }
 
       case "verify": {
         await this.step("verify");
         const sb = await this.sandbox(s);
-        const [lock, pkg] = await Promise.all([
-          sb.readFile(this.repoPath(s, p.lockfile)),
-          sb.readFile(this.dirPath(s, "package.json")),
-        ]);
-        if (lock === null) throw new Error(`Lockfile ${p.lockfile} missing after install`);
-        const deps = parseLockfile(p.manager, p.lockfile, lock, pkg).filter((d) => d.name === p.package);
-        const bad = deps.filter((d) => isAffected(d.version, s.incident.affected));
-        this.info(`${p.package} in lockfile: ${deps.map((d) => d.version).join(", ") || "not present"}`);
-        s.lockfileClean = bad.length === 0;
-        if (!s.lockfileClean) {
-          // Never run project code next to a known-bad version.
-          throw new Error(`Lockfile still resolves an affected version (${bad.map((d) => d.version).join(", ")}). Stopping before any tests run.`);
-        }
-        this.info("Lockfile is clean: no affected versions remain.");
+        for (const t of targets) await this.checkLockfile(sb, s, t);
+        s.lockfileClean = true;
+        this.info("Every lockfile is clean: no affected versions remain.");
+        s.cursor = 0;
         return "test";
       }
 
       case "test": {
         await this.step("test");
         const sb = await this.sandbox(s);
-        if (!s.testCommand) s.testCommand = await this.pickTestCommand(sb, s);
-        const r = await this.run(sb, `cd ${this.dirPath(s)} && ${s.testCommand}`, TEST_TIMEOUT);
+        const t = this.target(s);
+        s.tests[t.lockfile] ??= t.ecosystem === "PyPI" ? await this.pythonTestCommand(sb, s, t) : await this.npmTestCommand(sb, s, t);
+        const command = s.tests[t.lockfile]!;
+        const r = await this.run(sb, `cd ${this.dirPath(s, t)} && ${command}`, TEST_TIMEOUT);
         const passed = r.exitCode === 0;
         s.attempts.push({
           n: s.attempts.length + 1,
+          lockfile: t.lockfile,
           passed,
-          command: s.testCommand,
+          command,
           exitCode: r.exitCode,
           summary: passed ? "All checks passed" : r.output.trim().split("\n").slice(-6).join("\n").slice(0, 800),
         });
-        if (passed) return this.finishReady(sb, s);
+        if (passed) {
+          s.cursor++;
+          if (s.cursor < targets.length) return "test";
+          return this.finishReady(sb, s);
+        }
         s.lastFailure = r.output.slice(-8000);
         // An out-of-memory kill says nothing about the code; don't spend a repair round on it.
-        if (/^Killed$|exit code 137|JavaScript heap out of memory/m.test(r.output.slice(-4000)))
+        if (/^Killed$|exit code 137|JavaScript heap out of memory|MemoryError/m.test(r.output.slice(-4000)))
           throw new Error("Checks were killed for running out of memory in the sandbox. Use a larger DAYTONA_SNAPSHOT. No PR will be offered.");
         if (s.repairs >= MAX_REPAIRS) throw new Error(`Checks still failing after ${MAX_REPAIRS} repair attempts. No PR will be offered.`);
         if (!this.env.CLONVO_API_KEY) throw new Error("Checks failed and CLONVO_API_KEY is not set, so the agent can't attempt a repair.");
@@ -481,7 +481,7 @@ export class FixRun extends DurableObject<AppEnv> {
         await this.step("repair");
         const sb = await this.sandbox(s);
         s.repairs++;
-        await this.repair(sb, s);
+        await this.repair(sb, s, this.target(s));
         return "test";
       }
 
@@ -500,67 +500,281 @@ export class FixRun extends DurableObject<AppEnv> {
     }
   }
 
-  private async pickTestCommand(sb: Sandbox, s: State): Promise<string> {
-    const p = s.plan;
-    const raw = await sb.readFile(this.dirPath(s, "package.json"));
-    const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
-    const runner = p.manager === "npm" ? "npm run" : `${p.manager} run`;
-    const parts: string[] = [];
-    for (const name of ["typecheck", "type-check"]) if (scripts[name]) { parts.push(`${runner} ${name}`); break; }
-    if (scripts.test && !/no test specified/.test(scripts.test)) parts.push(p.manager === "npm" ? "npm test" : `${p.manager} run test`);
-    else if (scripts.build) parts.push(`${runner} build`);
-    if (parts.length) {
-      this.info(`Checks: ${parts.join(" && ")}`);
-      return parts.join(" && ");
+  // ── npm, pnpm, yarn, bun ──────────────────────────────────────────────────────────────────────────
+
+  private async patchNpm(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    let pnpmMajor = 0;
+    if (t.manager !== "npm") {
+      const tool = t.manager;
+      const ensure =
+        tool === "bun"
+          ? `command -v bun || (curl -fsSL https://bun.sh/install | bash) || npm i -g --prefix ~/.local bun`
+          : `command -v ${tool} || (mkdir -p ~/.local/bin && corepack enable --install-directory ~/.local/bin) || npm i -g --prefix ~/.local ${tool}`;
+      const r = await this.run(sb, `cd ${this.dirPath(s, t)} && (${ensure}) >/dev/null 2>&1; ${tool} --version`, 180);
+      if (r.exitCode !== 0) throw new Error(`Could not set up ${tool} in the sandbox`);
+      if (tool === "pnpm") pnpmMajor = Number(/(\d+)\.\d+\.\d+\s*$/.exec(r.output.trim())?.[1] ?? 0);
     }
-    this.info("No test, typecheck or build script found; confirming the installed version only.");
-    return `node -p "require('./node_modules/${p.package}/package.json').version"`;
+    await sb.writeFile("/tmp/fb-patch.cjs", PATCH_PACKAGE_JSON);
+    const changed: string[] = [];
+    let workspace: ReturnType<typeof parseDocument> | null = null;
+    const workspaceFile = this.dirPath(s, t, "pnpm-workspace.yaml");
+    for (const p of t.packages) {
+      await sb.writeFile(
+        "/tmp/fb-patch.json",
+        JSON.stringify({ root: this.dirPath(s, t), name: p.package, to: p.to, manager: t.manager, strategy: p.strategy, exact: p.exact, pnpmMajor }),
+      );
+      // Short and output-critical, so it runs through the synchronous exec rather than the streamed session.
+      this.emit({ type: "cmd", command: `patch package.json: ${p.package} → ${p.to}` });
+      const r = await sb.exec("node /tmp/fb-patch.cjs /tmp/fb-patch.json", { timeoutSec: 60 });
+      this.emit({ type: "exit", command: `patch package.json: ${p.package}`, exitCode: r.exitCode, ms: 0 });
+      if (r.exitCode !== 0) throw new Error(`Could not edit package.json for ${p.package}: ${r.output.slice(-500)}`);
+      const report = JSON.parse(r.output.trim().split("\n").pop() ?? "{}") as { changed: string[]; catalogs: { file: string; catalog: string }[]; overrideNeeded: boolean };
+
+      // pnpm catalogs and pnpm >= 10 overrides live in pnpm-workspace.yaml.
+      if (report.catalogs.length || report.overrideNeeded) {
+        workspace ??= parseDocument((await sb.readFile(workspaceFile)) ?? "");
+        const spec = p.exact ? p.to : `^${p.to}`;
+        for (const c of new Set(report.catalogs.map((x) => x.catalog))) {
+          const key = c === "default" && workspace.hasIn(["catalog", p.package]) ? ["catalog", p.package] : ["catalogs", c, p.package];
+          workspace.setIn(key, spec);
+          report.changed.push(`pnpm-workspace.yaml ${key.join(".")} = ${spec}`);
+        }
+        if (report.overrideNeeded) {
+          workspace.setIn(["overrides", p.package], p.to);
+          report.changed.push(`pnpm-workspace.yaml overrides.${p.package} = ${p.to}`);
+        }
+      }
+      if (!report.changed.length) throw new Error(`Nothing in ${t.dir || "the repo root"} declares ${p.package} in a form Firebreak can edit`);
+      changed.push(...report.changed);
+    }
+    if (workspace) await sb.writeFile(workspaceFile, workspace.toString());
+    this.info(changed.join("\n"));
   }
 
-  private async repair(sb: Sandbox, s: State): Promise<void> {
-    const p = s.plan;
-    const pkgRe = p.package.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-    const grep = await sb.exec(
-      `cd ${this.repoPath(s)} && grep -rlE "(from ['\\"]${pkgRe}(/[^'\\"]*)?['\\"]|require\\(['\\"]${pkgRe})" --include=*.ts --include=*.tsx --include=*.js --include=*.jsx --include=*.mjs --include=*.cjs --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git . | head -8`,
+  private async installNpm(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    const cmd =
+      t.manager === "npm"
+        ? "npm install --ignore-scripts --no-audit --no-fund"
+        : t.manager === "pnpm"
+          ? "pnpm install --ignore-scripts --no-frozen-lockfile"
+          : t.manager === "yarn"
+            ? s.yarnBerry[t.lockfile]
+              ? "YARN_ENABLE_IMMUTABLE_INSTALLS=false yarn install --mode=skip-build"
+              : "yarn install --ignore-scripts --non-interactive --no-frozen-lockfile"
+            : "bun install --ignore-scripts";
+    let r = await this.run(sb, `cd ${this.dirPath(s, t)} && ${cmd}`, INSTALL_TIMEOUT);
+    if (r.exitCode !== 0 && t.manager === "npm" && /ERESOLVE|peer dep/i.test(r.output)) {
+      this.info("Peer dependency conflict; retrying with --legacy-peer-deps.");
+      r = await this.run(sb, `cd ${this.dirPath(s, t)} && ${cmd} --legacy-peer-deps`, INSTALL_TIMEOUT);
+    }
+    if (r.exitCode !== 0) throw new Error(`Install failed in ${t.dir || "the repo root"} (exit ${r.exitCode ?? "timeout"})`);
+  }
+
+  private async npmTestCommand(sb: Sandbox, s: State, t: LockfileFix): Promise<string> {
+    const raw = await sb.readFile(this.dirPath(s, t, "package.json"));
+    const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
+    const runner = t.manager === "npm" ? "npm run" : `${t.manager} run`;
+    const parts: string[] = [];
+    for (const name of ["typecheck", "type-check"]) if (scripts[name]) { parts.push(`${runner} ${name}`); break; }
+    if (scripts.test && !/no test specified/.test(scripts.test)) parts.push(t.manager === "npm" ? "npm test" : `${t.manager} run test`);
+    else if (scripts.build) parts.push(`${runner} build`);
+    if (parts.length) {
+      this.info(`Checks for ${t.lockfile}: ${parts.join(" && ")}`);
+      return parts.join(" && ");
+    }
+    this.info(`No test, typecheck or build script for ${t.lockfile}; confirming the installed versions only.`);
+    const names = JSON.stringify(t.packages.map((p) => p.package));
+    return `node -p ${shq(`${names}.map(n => n + " " + require("./node_modules/" + n + "/package.json").version).join("\\n")`)}`;
+  }
+
+  // ── Python: uv and pinned requirements ────────────────────────────────────────────────────────────
+
+  private async ensureUv(sb: Sandbox, s: State): Promise<void> {
+    if (s.uvReady) return;
+    const r = await this.run(
+      sb,
+      `(command -v uv || (curl -LsSf https://astral.sh/uv/install.sh | sh) || python3 -m pip install --user -q uv) >/dev/null 2>&1; uv --version`,
+      180,
+      "uv --version",
     );
-    const fromError = [...new Set([...(s.lastFailure ?? "").matchAll(/((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:tsx?|jsx?|mjs|cjs))[:(]\d+/g)].map((m) => m[1]!.replace(/^\.\//, "")))]
-      .filter((f) => !f.includes("node_modules"))
-      .slice(0, 6);
-    const files = [...new Set([...grep.output.split("\n").map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean), ...fromError.map((f) => (p.dir && !f.startsWith(p.dir) ? `${p.dir}/${f}` : f))])].slice(0, 10);
+    if (r.exitCode !== 0) throw new Error("Could not set up uv in the sandbox");
+    s.uvReady = true;
+  }
+
+  private async patchPython(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    await this.ensureUv(sb, s);
+    await sb.writeFile("/tmp/fb-patch.py", PATCH_PYTHON);
+    await sb.writeFile(
+      "/tmp/fb-patch-py.json",
+      JSON.stringify({
+        repo: this.repoPath(s),
+        root: this.dirPath(s, t),
+        manager: t.manager,
+        file: this.repoPath(s, t.lockfile),
+        packages: t.packages.map((p) => ({ name: p.package, to: p.to, exact: p.exact })),
+      }),
+    );
+    const label = t.manager === "uv" ? "patch pyproject.toml" : `patch ${t.lockfile}`;
+    this.emit({ type: "cmd", command: label });
+    const r = await sb.exec("python3 /tmp/fb-patch.py /tmp/fb-patch-py.json", { timeoutSec: 60 });
+    this.emit({ type: "exit", command: label, exitCode: r.exitCode, ms: 0 });
+    if (r.exitCode !== 0) throw new Error(`Could not edit ${t.lockfile}: ${r.output.slice(-500)}`);
+    const report = JSON.parse(r.output.trim().split("\n").pop() ?? "{}") as { changed: string[]; compile: { in: string; hashes: boolean } | null; error: string | null };
+    if (report.error) throw new Error(report.error);
+    s.pyCompile[t.lockfile] = report.compile;
+    if (report.compile) this.info(`${t.lockfile} is compiled from ${report.compile.in.slice(this.repoPath(s).length + 1)}; it will be regenerated with the new pins.`);
+    else if (report.changed.length) this.info(report.changed.join("\n"));
+    else if (t.manager === "uv") this.info("pyproject.toml already allows every target version; uv lock pins them.");
+    else throw new Error(`${t.lockfile} doesn't pin ${t.packages.map((p) => p.package).join(", ")}`);
+  }
+
+  private async installPython(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    const dir = this.dirPath(s, t);
+    const pins = (withVersion: boolean) => t.packages.map((p) => `-P ${shq(withVersion ? `${p.package}==${p.to}` : p.package)}`).join(" ");
+    if (t.manager === "uv") {
+      let r = await this.run(sb, `cd ${dir} && ${this.uv(s, t, `lock ${pins(true)}`)}`, INSTALL_TIMEOUT);
+      if (r.exitCode !== 0) {
+        this.info("uv couldn't lock the exact versions; letting it pick the newest allowed ones instead.");
+        r = await this.run(sb, `cd ${dir} && ${this.uv(s, t, `lock ${pins(false)}`)}`, INSTALL_TIMEOUT);
+      }
+      if (r.exitCode !== 0) throw new Error(`uv lock failed in ${t.dir || "the repo root"} (exit ${r.exitCode ?? "timeout"})`);
+      // Resolve first and check the result, so a known-bad release is never downloaded and built.
+      await this.checkLockfile(sb, s, t);
+      r = await this.run(sb, `cd ${dir} && (${this.uv(s, t, "sync --frozen --all-extras --all-groups")} || ${this.uv(s, t, "sync --frozen --all-extras")})`, INSTALL_TIMEOUT);
+      if (r.exitCode !== 0) throw new Error(`uv sync failed in ${t.dir || "the repo root"} (exit ${r.exitCode ?? "timeout"})`);
+      return;
+    }
+    const file = this.repoPath(s, t.lockfile);
+    const fileDir = file.slice(0, file.lastIndexOf("/"));
+    const compile = s.pyCompile[t.lockfile];
+    if (compile) {
+      const r = await this.run(
+        sb,
+        `cd ${fileDir} && uv pip compile ${shq(compile.in)} -o ${shq(file)} ${pins(true)}${compile.hashes ? " --generate-hashes" : ""}`,
+        INSTALL_TIMEOUT,
+      );
+      if (r.exitCode !== 0) throw new Error(`Recompiling ${t.lockfile} failed (exit ${r.exitCode ?? "timeout"})`);
+    }
+    await this.checkLockfile(sb, s, t);
+    const venv = this.venv(s, t);
+    const r = await this.run(sb, `cd ${fileDir} && uv venv -q ${venv} && uv pip install --python ${venv} -r ${shq(file)}`, INSTALL_TIMEOUT);
+    if (r.exitCode !== 0) throw new Error(`pip install failed for ${t.lockfile} (exit ${r.exitCode ?? "timeout"})`);
+  }
+
+  private async pythonTestCommand(sb: Sandbox, s: State, t: LockfileFix): Promise<string> {
+    const dir = this.dirPath(s, t);
+    const hasTests =
+      (
+        await sb.exec(
+          `cd ${dir} && { ls -d pytest.ini conftest.py tests test 2>/dev/null | grep -q . || grep -qs '^\\[tool.pytest' pyproject.toml || grep -qs '^\\[tool:pytest\\]' setup.cfg || grep -qs '^\\[pytest\\]' tox.ini; }`,
+        )
+      ).exitCode === 0;
+    const venv = this.venv(s, t);
+    const py = t.manager === "uv" ? this.uv(s, t, "run --frozen python") : `${venv}/bin/python`;
+    if (hasTests) {
+      const pytest =
+        t.manager === "uv"
+          ? this.uv(s, t, "run --frozen --with pytest python -m pytest -q")
+          : `{ ${venv}/bin/python -m pytest --version >/dev/null 2>&1 || uv pip install -q --python ${venv} pytest; } && ${venv}/bin/python -m pytest -q`;
+      this.info(`Checks for ${t.lockfile}: pytest`);
+      // pytest exits 5 when it collects no tests; that's not a failure of the upgrade.
+      return `( ${pytest}; rc=$?; if [ $rc -eq 5 ]; then echo "pytest collected no tests"; rc=0; fi; exit $rc )`;
+    }
+    this.info(`No tests found for ${t.lockfile}; compiling every module and confirming the installed versions.`);
+    const names = JSON.stringify(t.packages.map((p) => p.package));
+    return `${py} -m compileall -q -x '(^|/)(\\.venv|venv|node_modules|\\.git)(/|$)' . && ${py} -c ${shq(`import importlib.metadata as m; [print(n, m.version(n)) for n in ${names}]`)}`;
+  }
+
+  // ── lockfile check (shared) ───────────────────────────────────────────────────────────────────────
+
+  /** Fails the run if any bumped package still resolves a version flagged by any known advisory. */
+  private async checkLockfile(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    const lock = await sb.readFile(this.repoPath(s, t.lockfile));
+    if (lock === null) throw new Error(`Lockfile ${t.lockfile} missing after install`);
+    const manifest = t.manager === "pip" ? null : await sb.readFile(this.dirPath(s, t, t.manager === "uv" ? "pyproject.toml" : "package.json"));
+    const deps = parseLockfile(t.manager, t.lockfile, lock, manifest);
+    const bad: string[] = [];
+    for (const p of t.packages) {
+      const found = deps.filter((d) => d.name === p.package);
+      const affected = s.avoid[`${t.ecosystem}:${p.package}`] ?? [];
+      const hits = found.filter((d) => affected.some((a) => isAffected(d.version, a, t.ecosystem)));
+      this.info(`${p.package} in ${t.lockfile}: ${found.map((d) => d.version).join(", ") || "not present"}`);
+      if (hits.length) bad.push(`${p.package} ${hits.map((d) => d.version).join(", ")}`);
+    }
+    if (bad.length) {
+      s.lockfileClean = false;
+      // Never run project code next to a known-bad version.
+      throw new Error(`${t.lockfile} still resolves affected versions (${bad.join("; ")}). Stopping before any tests run.`);
+    }
+  }
+
+  // ── agent repair ──────────────────────────────────────────────────────────────────────────────────
+
+  private async repair(sb: Sandbox, s: State, t: LockfileFix): Promise<void> {
+    const python = t.ecosystem === "PyPI";
+    const root = this.repoPath(s);
+    const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    let grepCmd: string;
+    let fromError: string[];
+    const failure = s.lastFailure ?? "";
+    if (python) {
+      const modules = t.packages.map((p) => esc(p.package.replace(/-/g, "_"))).join("|");
+      grepCmd = `cd ${root} && grep -rliE "^\\s*(from|import)\\s+(${modules})\\b" --include=*.py --exclude-dir=.venv --exclude-dir=venv --exclude-dir=.git --exclude-dir=node_modules . | head -8`;
+      fromError = [
+        ...[...failure.matchAll(/File "([^"]+\.py)", line \d+/g)].map((m) => m[1]!),
+        ...[...failure.matchAll(/(?:^|\s)((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.py):\d+/gm)].map((m) => m[1]!),
+      ]
+        .filter((f) => !/site-packages|\/tmp\/|^\/usr\//.test(f))
+        .map((f) => (f.startsWith(`${root}/`) ? f.slice(root.length + 1) : f.startsWith("/") ? "" : t.dir && !f.startsWith(t.dir) ? `${t.dir}/${f.replace(/^\.\//, "")}` : f.replace(/^\.\//, "")))
+        .filter(Boolean);
+    } else {
+      const names = t.packages.map((p) => esc(p.package)).join("|");
+      grepCmd = `cd ${root} && grep -rlE "(from ['\\"](${names})(/[^'\\"]*)?['\\"]|require\\(['\\"](${names}))" --include=*.ts --include=*.tsx --include=*.js --include=*.jsx --include=*.mjs --include=*.cjs --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git . | head -8`;
+      fromError = [...failure.matchAll(/((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:tsx?|jsx?|mjs|cjs))[:(]\d+/g)]
+        .map((m) => m[1]!.replace(/^\.\//, ""))
+        .filter((f) => !f.includes("node_modules"))
+        .map((f) => (t.dir && !f.startsWith(t.dir) ? `${t.dir}/${f}` : f));
+    }
+    const grep = await sb.exec(grepCmd);
+    const files = [...new Set([...grep.output.split("\n").map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean), ...new Set(fromError.slice(0, 6))])].slice(0, 10);
     const contents: string[] = [];
     for (const f of files) {
       const text = await sb.readFile(this.repoPath(s, f));
       if (text !== null) contents.push(`--- ${f}\n${text.slice(0, 15_000)}`);
     }
-    this.emit({ type: "agent", text: `Reading ${contents.length} file${contents.length === 1 ? "" : "s"} that use ${p.package} or appear in the failure.` });
+    const changes = t.packages.map((p) => `${p.package} ${p.from.join("/")} → ${p.to}`);
+    this.emit({ type: "agent", text: `Reading ${contents.length} file${contents.length === 1 ? "" : "s"} that use ${t.packages.map((p) => p.package).join(", ")} or appear in the failure.` });
 
+    // Migration notes for the bump most likely behind the failure: one named in the output, else the first.
+    const suspect = t.packages.find((p) => failure.toLowerCase().includes(p.package.toLowerCase())) ?? t.packages[0]!;
     let notes = "";
     if (this.env.YOU_API_KEY) {
       try {
-        const results = await search(this.env, `${p.package} ${p.to} migration guide breaking changes upgrade from ${p.from}`, { count: 5, highlights: true });
+        const results = await search(this.env, `${suspect.package} ${suspect.to} migration guide breaking changes upgrade from ${suspect.from.at(-1)}`, { count: 5, highlights: true });
         notes = results
           .map((r) => `Source: ${r.url}\n${(r.highlights.length ? r.highlights : r.snippets).slice(0, 4).join("\n")}`)
           .join("\n\n")
           .slice(0, 10_000);
         for (const r of results.slice(0, 3)) if (!s.migrationSources.some((m) => m.url === r.url)) s.migrationSources.push({ kind: "news", title: r.title, url: r.url });
-        this.emit({ type: "agent", text: `Pulled migration notes from ${results.length} sources via You.com.` });
+        this.emit({ type: "agent", text: `Pulled ${suspect.package} migration notes from ${results.length} sources via You.com.` });
       } catch (e) {
         this.info(`Migration search skipped: ${(e as Error).message}`);
       }
     }
 
+    const language = python ? "Python" : "JavaScript/TypeScript";
+    const manifests = python ? "lockfiles, pyproject.toml, requirements files, virtualenvs" : "lockfiles, package.json, node_modules";
     const reply = await chat(
       this.env,
       this.env.FIX_MODEL,
       [
         {
           role: "system",
-          content:
-            "You repair a JavaScript/TypeScript codebase after a dependency version change. Make the smallest source edits that make the failing checks pass. Never edit lockfiles, package.json, node_modules, or tests' expectations to hide failures. Each edit's `find` must be copied exactly from the file and match once. Reply with JSON only.",
+          content: `You repair a ${language} codebase after dependency version changes. Make the smallest source edits that make the failing checks pass. Never edit ${manifests}, or tests' expectations to hide failures. Each edit's \`find\` must be copied exactly from the file and match once. Reply with JSON only.`,
         },
         {
           role: "user",
-          content: `Dependency change: ${p.package} ${p.from} → ${p.to} (${p.manager}).\nCommand: ${s.testCommand}\n\nFailure output (tail):\n${s.lastFailure}\n\nMigration notes:\n${notes || "(none)"}\n\nFiles (paths relative to the repo root):\n${contents.join("\n\n") || "(none found)"}\n\nReply as {"explanation":"one or two sentences","edits":[{"path":"src/file.ts","find":"exact old text","replace":"new text"}]}. Use an empty edits list if the failure is unrelated to the upgrade.`,
+          content: `Dependency changes in ${t.lockfile} (${t.manager}):\n${changes.join("\n")}\nCommand: ${s.tests[t.lockfile]}\n\nFailure output (tail):\n${failure}\n\nMigration notes (${suspect.package}):\n${notes || "(none)"}\n\nFiles (paths relative to the repo root):\n${contents.join("\n\n") || "(none found)"}\n\nReply as {"explanation":"one or two sentences","edits":[{"path":"src/file.ext","find":"exact old text","replace":"new text"}]}. Use an empty edits list if the failure is unrelated to the upgrades.`,
         },
       ],
       { maxTokens: 6000 },
@@ -573,7 +787,7 @@ export class FixRun extends DurableObject<AppEnv> {
     const edits = plan.edits ?? [];
     if (!edits.length) throw new Error("The agent found no safe source change for this failure. No PR will be offered.");
     await sb.writeFile("/tmp/fb-apply.cjs", APPLY_EDITS);
-    await sb.writeFile("/tmp/fb-edits.json", JSON.stringify({ root: this.repoPath(s), edits }));
+    await sb.writeFile("/tmp/fb-edits.json", JSON.stringify({ root, edits }));
     const r = await sb.exec("node /tmp/fb-apply.cjs /tmp/fb-edits.json");
     let report: { path: string; ok: boolean; error?: string }[] = [];
     try {
@@ -590,12 +804,12 @@ export class FixRun extends DurableObject<AppEnv> {
     s.changedFiles = status.output
       .split("\n")
       .map((l) => l.slice(3).trim())
-      .filter((f) => f && !f.includes("node_modules"));
+      .filter((f) => f && !/(^|\/)(node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.venv|venv)(\/|$)|\.egg-info(\/|$)/.test(f));
     const diff = await sb.exec(`cd ${this.repoPath(s)} && git diff --stat && echo && git diff -- . ':(exclude)*lock*' ':(exclude)*.lockb'`);
     s.diff = diff.output.slice(0, 30_000);
     // Keep the verified files here so the sandbox can go now; the PR doesn't depend on it staying alive.
     for (const path of s.changedFiles) {
-      if (path.endsWith(".lockb")) continue;
+      if (path.endsWith(".lockb") || path.endsWith("/")) continue;
       const content = await sb.readFile(this.repoPath(s, path));
       if (content !== null) this.storeFile(path, content);
     }
@@ -608,29 +822,36 @@ export class FixRun extends DurableObject<AppEnv> {
 
   // ── live preview (after a verified fix) ───────────────────────────────────────────────────────────
 
-  /** Picks the script that serves the app and adds flags so it listens on PREVIEW_PORT on every interface. */
-  private async previewCommand(sb: Sandbox, s: State): Promise<string | null> {
-    const p = s.plan;
-    const raw = await sb.readFile(this.dirPath(s, "package.json"));
-    const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
-    const name = ["dev", "start", "preview"].find((n) => scripts[n] && !/^\s*(echo|exit)\b/.test(scripts[n]!));
-    if (!name) return null;
-    const script = scripts[name]!;
-    const run = p.manager === "npm" ? `npm run ${name} --` : `${p.manager} run ${name}`;
-    const port = String(PREVIEW_PORT);
-    if (/\bnext\b/.test(script)) return `${run} -H 0.0.0.0 -p ${port}`;
-    if (/\b(vite|astro|react-router|remix|nuxt|svelte-kit|vinext)\b/.test(script) && !/\bvitest\b/.test(script)) return `${run} --host 0.0.0.0 --port ${port}`;
-    if (/\bwrangler\b/.test(script)) return `${run} --ip 0.0.0.0 --port ${port}`;
-    return `${p.manager === "npm" ? `npm run ${name}` : `${p.manager} run ${name}`}`;
+  /** Picks a JS project's script that serves the app and adds flags so it listens on PREVIEW_PORT on every interface. */
+  private async previewCommand(sb: Sandbox, s: State): Promise<{ command: string; target: LockfileFix } | null> {
+    for (const t of s.plan.targets) {
+      if (t.ecosystem !== "npm") continue;
+      const raw = await sb.readFile(this.dirPath(s, t, "package.json"));
+      const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
+      const name = ["dev", "start", "preview"].find((n) => scripts[n] && !/^\s*(echo|exit)\b/.test(scripts[n]!));
+      if (!name) continue;
+      const script = scripts[name]!;
+      const run = t.manager === "npm" ? `npm run ${name} --` : `${t.manager} run ${name}`;
+      const port = String(PREVIEW_PORT);
+      if (/\bnext\b/.test(script)) return { target: t, command: `${run} -H 0.0.0.0 -p ${port}` };
+      if (/\b(vite|astro|react-router|remix|nuxt|svelte-kit|vinext)\b/.test(script) && !/\bvitest\b/.test(script)) return { target: t, command: `${run} --host 0.0.0.0 --port ${port}` };
+      if (/\bwrangler\b/.test(script)) return { target: t, command: `${run} --ip 0.0.0.0 --port ${port}` };
+      return { target: t, command: t.manager === "npm" ? `npm run ${name}` : `${t.manager} run ${name}` };
+    }
+    return null;
   }
 
   private async startPreview(s: State): Promise<Phase> {
     const sb = await this.sandbox(s);
-    const command = await this.previewCommand(sb, s);
-    if (!command) {
-      await this.endPreview(s, "No dev, start or preview script in package.json, so there is nothing to serve.", "unavailable");
+    const picked = await this.previewCommand(sb, s);
+    if (!picked) {
+      const note = s.plan.targets.some((t) => t.ecosystem === "npm")
+        ? "No dev, start or preview script in package.json, so there is nothing to serve."
+        : "Live preview covers JavaScript apps with a dev, start or preview script; this run only changed Python projects.";
+      await this.endPreview(s, note, "unavailable");
       return "ready";
     }
+    const { command, target } = picked;
     await this.setPreview(s, { state: "starting", command, port: PREVIEW_PORT });
     const signed = await sb.signedPreviewUrl(PREVIEW_PORT, PREVIEW_TTL_SEC);
     const host = new URL(signed.url).hostname;
@@ -639,7 +860,7 @@ export class FixRun extends DurableObject<AppEnv> {
     this.emit({ type: "cmd", command });
     await sb.startCommand(
       SESSION,
-      `cd ${this.dirPath(s)} && PORT=${PREVIEW_PORT} HOST=0.0.0.0 HOSTNAME=0.0.0.0 BROWSER=none __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${allowed} nohup ${command} > /tmp/fb-preview.log 2>&1 &`,
+      `cd ${this.dirPath(s, target)} && PORT=${PREVIEW_PORT} HOST=0.0.0.0 HOSTNAME=0.0.0.0 BROWSER=none __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${allowed} nohup ${command} > /tmp/fb-preview.log 2>&1 &`,
     );
     const started = Date.now();
     let up = false;
@@ -692,14 +913,21 @@ export class FixRun extends DurableObject<AppEnv> {
       }
     }
     if (!files.length) throw new Error("No changed files to commit");
-    const p = s.plan;
-    const verb = p.strategy === "pin-back" ? "pin" : p.strategy === "override" ? "override" : "upgrade";
+    const all = planPackages(s.plan);
+    const ids = s.incidents.map((i) => i.id);
+    const one = all.length === 1 ? all[0]! : null;
+    const verb = one ? (one.strategy === "pin-back" ? "pin" : one.strategy === "override" ? "override" : "upgrade") : "bump";
+    const title = one
+      ? `fix(deps): ${verb} ${one.package} ${one.from.join(", ")} → ${one.to}${ids.length === 1 ? ` (${ids[0]})` : ""}`
+      : `fix(deps): bump ${all.length} packages to clear ${ids.length} advisor${ids.length === 1 ? "y" : "ies"}`;
     const url = await openPullRequest(this.env, {
       fullName: s.fullName,
       base: s.defaultBranch,
-      branch: `firebreak/${p.package.replace(/[@/]/g, "-").replace(/^-/, "")}-${p.to}-${s.runId.slice(0, 6)}`,
-      title: `fix(deps): ${verb} ${p.package} ${p.from} → ${p.to} (${s.incident.id})`,
-      message: `fix(deps): ${verb} ${p.package} ${p.from} → ${p.to}\n\n${s.incident.id}: ${s.incident.title}`,
+      branch: one
+        ? `firebreak/${one.package.replace(/[@/]/g, "-").replace(/^-/, "")}-${one.to}-${s.runId.slice(0, 6)}`
+        : `firebreak/fix-${all.length}-packages-${s.runId.slice(0, 6)}`,
+      title,
+      message: `${title}\n\n${all.map((p) => `- ${p.package} ${p.from.join(", ")} → ${p.to} (${p.lockfile})`).join("\n")}\n\n${s.incidents.map((i) => `${i.id}: ${i.title}`).join("\n")}`,
       body: this.receipt(s),
       files,
     });
@@ -718,30 +946,45 @@ export class FixRun extends DurableObject<AppEnv> {
   }
 
   private receipt(s: State): string {
-    const p = s.plan;
-    const mins = Math.round((Date.now() - s.startedAt) / 1000);
+    const all = planPackages(s.plan);
+    const secs = Math.round((s.verifiedMs ?? Date.now() - s.startedAt) / 1000);
+    const python = s.plan.targets.some((t) => t.ecosystem === "PyPI");
+    const npm = s.plan.targets.some((t) => t.ecosystem === "npm");
+    const cell = (x: string) => x.replace(/\|/g, "\\|");
     const lines = [
       `## Firebreak hotfix receipt`,
       ``,
-      `**Incident:** ${s.incident.id} · ${s.incident.title}${s.incident.severity ? ` · ${s.incident.severity}` : ""}`,
-      `**Change:** \`${p.package}\` ${p.from} → **${p.to}** (${p.strategy}, ${p.manager}, \`${p.lockfile}\`)`,
-      `**Why this version:** ${p.reason}`,
+      `| Package | From | To | Change | Lockfile | Advisories |`,
+      `| --- | --- | --- | --- | --- | --- |`,
+      ...all.map(
+        (p) =>
+          `| \`${p.package}\` | ${p.from.join(", ")} | **${p.to}** | ${p.strategy} | \`${cell(p.lockfile)}\` | ${p.incidents.map((i) => `${i.id}${i.kind === "malicious" ? " (malicious)" : i.severity ? ` (${i.severity})` : ""}`).join(", ") || "n/a"} |`,
+      ),
+      ``,
+      `**Why these versions**`,
+      ...all.map((p) => `- \`${p.package}\`: ${p.reason}`),
       ``,
       `### Verified in an isolated Daytona sandbox`,
-      `- Installed with lifecycle scripts disabled`,
-      `- Lockfile clean: ${s.lockfileClean ? "yes, no affected versions of " + p.package + " remain" : "not verified"}`,
-      `- Checks: \`${s.testCommand ?? "none"}\``,
-      ...s.attempts.map((a) => `  - Attempt ${a.n}: ${a.passed ? "✅ passed" : `❌ failed (exit ${a.exitCode ?? "timeout"})`}`),
+      ...(npm ? [`- npm installs ran with lifecycle scripts disabled`] : []),
+      ...(python ? [`- Python lockfiles were resolved and checked before anything was installed`] : []),
+      `- Lockfiles clean: ${s.lockfileClean ? "yes, no affected versions of the bumped packages remain" : "not verified"}`,
+      `- Checks:`,
+      ...s.attempts.map((a) => `  - Attempt ${a.n}${a.lockfile ? ` (\`${a.lockfile}\`)` : ""}: \`${a.command}\` ${a.passed ? "✅ passed" : `❌ failed (exit ${a.exitCode ?? "timeout"})`}`),
       ...(s.agentNotes.length ? [``, `### Agent repairs`, ...s.agentNotes.map((n) => `- ${n}`)] : []),
       ``,
       `### Sources`,
-      ...s.incident.sources.slice(0, 6).map((src) => `- [${src.title}](${src.url})`),
+      ...s.incidents.flatMap((i) => i.sources.slice(0, 3).map((src) => `- ${i.id}: [${src.title}](${src.url})`)),
       ...s.migrationSources.map((src) => `- Migration notes: [${src.title}](${src.url})`),
       ``,
-      `Time from run start to verified fix: ${Math.floor(mins / 60)}m ${mins % 60}s.`,
+      `Time from run start to verified fix: ${Math.floor(secs / 60)}m ${secs % 60}s.`,
       ``,
       `_Opened by Firebreak. Review the diff before merging._`,
     ];
     return lines.join("\n");
   }
+}
+
+/** Single-quotes a string for the shell. */
+function shq(x: string): string {
+  return `'${x.replace(/'/g, `'\\''`)}'`;
 }

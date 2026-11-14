@@ -1,6 +1,11 @@
 // Types shared by the Worker API and the web app.
 
-export type Manager = "npm" | "pnpm" | "yarn" | "bun";
+export type Manager = "npm" | "pnpm" | "yarn" | "bun" | "uv" | "pip";
+
+/** Ecosystems Firebreak can fix automatically, named as OSV names them. */
+export type FixEcosystem = "npm" | "PyPI";
+
+export const ecosystemOf = (manager: Manager): FixEcosystem => (manager === "uv" || manager === "pip" ? "PyPI" : "npm");
 
 export interface LockfileSummary {
   path: string;
@@ -91,21 +96,60 @@ export type RunStatus = "queued" | "running" | "passed" | "failed" | "pr_opened"
 export const RUN_STEPS = ["plan", "sandbox", "clone", "patch", "install", "verify", "test", "repair", "ready"] as const;
 export type RunStep = (typeof RUN_STEPS)[number];
 
-export interface FixPlan {
-  strategy: "upgrade" | "pin-back" | "override";
+export interface FixIncidentRef {
+  id: string;
+  kind: IncidentKind;
+  severity: Severity | null;
+  title: string;
+}
+
+/** One package bump inside a repo-level fix. */
+export interface PackageFix {
+  /** Stable id for the checklist: "<lockfile>::<package>". */
+  key: string;
   package: string;
-  from: string;
+  /** Versions the lockfile resolves today (a lockfile can hold several copies). */
+  from: string[];
   to: string;
-  manager: Manager;
-  lockfile: string;
-  /** Directory holding the lockfile and package.json, relative to the repo root ("" for the root). */
-  dir: string;
+  strategy: "upgrade" | "pin-back" | "override";
   direct: boolean;
+  /** Pin exactly (malicious releases, pin-backs) instead of allowing compatible updates. */
+  exact: boolean;
+  incidents: FixIncidentRef[];
   reason: string;
+}
+
+/** All bumps for one lockfile; a run installs and checks each lockfile's project in turn. */
+export interface LockfileFix {
+  lockfile: string;
+  /** Directory of the project the lockfile belongs to, relative to the repo root ("" for the root). */
+  dir: string;
+  manager: Manager;
+  ecosystem: FixEcosystem;
+  packages: PackageFix[];
+}
+
+/** An exposure Firebreak can't fix automatically, with the reason. */
+export interface SkippedFix {
+  key: string;
+  package: string;
+  ecosystem: string;
+  lockfile: string;
+  versions: string[];
+  incidents: FixIncidentRef[];
+  reason: string;
+}
+
+/** A repo-level fix: every chosen package across the repo's lockfiles, verified in one sandbox and shipped as one PR. */
+export interface FixPlan {
+  targets: LockfileFix[];
+  skipped: SkippedFix[];
 }
 
 export interface RunAttempt {
   n: number;
+  /** Lockfile whose project these checks ran in. */
+  lockfile?: string;
   passed: boolean;
   command: string;
   exitCode: number | null;
@@ -136,11 +180,10 @@ export interface RunResult {
 
 export interface Run {
   id: string;
-  incidentId: string;
   repoId: string;
   repoFullName: string;
-  incidentTitle: string;
-  package: string;
+  /** Every advisory the run's bumps clear. */
+  incidentIds: string[];
   status: RunStatus;
   step: RunStep;
   plan: FixPlan | null;
@@ -175,4 +218,8 @@ export interface Overview {
 }
 
 /** A RunEvent without its timestamp (distributes over the union). */
+/** Every package bump in a plan, flattened. */
+export const planPackages = (plan: FixPlan | null): (PackageFix & { lockfile: string; manager: Manager })[] =>
+  plan ? plan.targets.flatMap((t) => t.packages.map((p) => ({ ...p, lockfile: t.lockfile, manager: t.manager }))) : [];
+
 export type RunEventInput = RunEvent extends infer E ? (E extends RunEvent ? Omit<E, "t"> : never) : never;

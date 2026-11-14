@@ -2,10 +2,9 @@ import { Hono } from "hono";
 import type { Exposure, Overview, Run, WatchStatus } from "@shared/types";
 import { MissingKeyError, now, shortId, type AppEnv } from "./env";
 import { getIncident, getRepoById, getRun, INCIDENT_SELECT, REPO_SELECT, RUN_SELECT, rowToExposure, rowToIncident, rowToRepo, rowToRun } from "./db";
-import { getPackument } from "./integrations/npm-registry";
-import { managerFor } from "./lockfiles";
+import { planPackages, type Incident } from "@shared/types";
+import { pickFromPlan, planRepoFix } from "./fix/plan";
 import { addRepo, scanRepo } from "./scan";
-import { buildPlan } from "./versions";
 import { matchExposures, runWatch } from "./watch";
 import type { StartRun } from "./fix/run";
 
@@ -86,11 +85,59 @@ app.post("/repos", async (c) => {
 app.get("/repos/:id", async (c) => {
   const repo = await getRepoById(c.env, c.req.param("id"));
   if (!repo) return c.json({ error: "Repo not found" }, 404);
-  const [exposures, deps] = await Promise.all([
+  const [exposures, deps, runs] = await Promise.all([
     exposuresFor(c.env, "e.repo_id", repo.id),
     c.env.DB.prepare("SELECT ecosystem, name, version, lockfile, direct FROM deps WHERE repo_id = ? AND direct = 1 ORDER BY name LIMIT 300").bind(repo.id).all(),
+    c.env.DB.prepare(`${RUN_SELECT} WHERE ru.repo_id = ? ORDER BY ru.started_at DESC LIMIT 20`).bind(repo.id).all(),
   ]);
-  return c.json({ repo, exposures, directDeps: deps.results });
+  return c.json({ repo, exposures, directDeps: deps.results, runs: runs.results.map(rowToRun) });
+});
+
+// Every exposed package in the repo with the version Firebreak would move it to. Reads the registries; changes nothing.
+app.get("/repos/:id/fix-plan", async (c) => {
+  const repo = await getRepoById(c.env, c.req.param("id"));
+  if (!repo) return c.json({ error: "Repo not found" }, 404);
+  return c.json(await planRepoFix(c.env, repo.id));
+});
+
+// Starts one fix run for the checked packages: one sandbox, one set of checks, one PR.
+app.post("/repos/:id/fix", async (c) => {
+  const env = c.env;
+  const repo = await getRepoById(env, c.req.param("id"));
+  if (!repo) return c.json({ error: "Repo not found" }, 404);
+  const { keys } = await c.req.json<{ keys: string[] }>();
+  for (const key of ["DAYTONA_API_KEY", "GITHUB_TOKEN"] as const) if (!env[key]) throw new MissingKeyError(key);
+  const plan = pickFromPlan(await planRepoFix(env, repo.id), keys ?? []);
+  const packages = planPackages(plan);
+  if (!packages.length) return c.json({ error: "None of the picked packages can be fixed any more. Rescan the repo." }, 400);
+
+  const incidentIds = [...new Set(packages.flatMap((p) => p.incidents.map((i) => i.id)))];
+  const incidents = (await Promise.all(incidentIds.map((id) => getIncident(env, id)))).filter((i): i is Incident => !!i);
+  // The sandbox's lockfile check rejects any version flagged by any known advisory for each bumped package.
+  const avoid: StartRun["avoid"] = {};
+  for (const t of plan.targets) {
+    for (const p of t.packages) {
+      const all = await env.DB.prepare(`${INCIDENT_SELECT} WHERE i.ecosystem = ? AND i.package = ?`).bind(t.ecosystem, p.package).all();
+      avoid[`${t.ecosystem}:${p.package}`] = all.results.map(rowToIncident).map((i) => i.affected);
+    }
+  }
+
+  const id = shortId();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO runs (id, repo_id, status, step, plan, started_at) VALUES (?, ?, 'queued', 'plan', ?, ?)").bind(id, repo.id, JSON.stringify(plan), now()),
+    ...incidentIds.map((iid) => env.DB.prepare("INSERT INTO run_incidents (run_id, incident_id) VALUES (?, ?)").bind(id, iid)),
+  ]);
+  const start: StartRun = {
+    runId: id,
+    fullName: repo.fullName,
+    defaultBranch: repo.defaultBranch,
+    plan,
+    avoid,
+    incidents: incidents.map((i) => ({ id: i.id, kind: i.kind, title: i.title, severity: i.severity, sources: i.sources })),
+  };
+  const stub = env.FIX_RUN.get(env.FIX_RUN.idFromName(id));
+  await stub.fetch("https://run/start", { method: "POST", body: JSON.stringify(start) });
+  return c.json((await getRun(env, id)) as Run);
 });
 
 app.post("/repos/:id/scan", async (c) => {
@@ -118,7 +165,7 @@ app.get("/incidents/:id", async (c) => {
   if (!incident) return c.json({ error: "Incident not found" }, 404);
   const [exposures, runs] = await Promise.all([
     exposuresFor(c.env, "e.incident_id", incident.id),
-    c.env.DB.prepare(`${RUN_SELECT} WHERE ru.incident_id = ? ORDER BY ru.started_at DESC`).bind(incident.id).all(),
+    c.env.DB.prepare(`${RUN_SELECT} WHERE ru.id IN (SELECT run_id FROM run_incidents WHERE incident_id = ?) ORDER BY ru.started_at DESC`).bind(incident.id).all(),
   ]);
   return c.json({ incident, exposures, runs: runs.results.map(rowToRun) });
 });
@@ -128,51 +175,6 @@ app.get("/incidents/:id", async (c) => {
 app.get("/runs", async (c) => {
   const rows = await c.env.DB.prepare(`${RUN_SELECT} ORDER BY ru.started_at DESC LIMIT 50`).all();
   return c.json(rows.results.map(rowToRun));
-});
-
-app.post("/runs", async (c) => {
-  const env = c.env;
-  const body = await c.req.json<{ incidentId: string; repoId: string; lockfile: string; version: string }>();
-  const [incident, repo] = await Promise.all([getIncident(env, body.incidentId), getRepoById(env, body.repoId)]);
-  if (!incident || !repo) return c.json({ error: "Incident or repo not found" }, 404);
-  if (incident.ecosystem !== "npm") return c.json({ error: `Automatic fixes cover npm packages; this incident is ${incident.ecosystem}.` }, 400);
-  const exposure = await env.DB.prepare("SELECT * FROM exposures WHERE incident_id = ? AND repo_id = ? AND lockfile = ? AND version = ?")
-    .bind(incident.id, repo.id, body.lockfile, body.version)
-    .first<{ direct: number }>();
-  if (!exposure) return c.json({ error: "That exposure no longer exists. Rescan the repo." }, 404);
-  const manager = managerFor(body.lockfile);
-  if (!manager) return c.json({ error: "Unknown lockfile" }, 400);
-  for (const key of ["DAYTONA_API_KEY", "GITHUB_TOKEN"] as const) if (!env[key]) throw new MissingKeyError(key);
-
-  // Every other advisory for the same package: the chosen version must clear all of them, not just this one.
-  const others = (await env.DB.prepare(`${INCIDENT_SELECT} WHERE i.ecosystem = ? AND i.package = ? AND i.id != ?`).bind(incident.ecosystem, incident.package, incident.id).all()).results.map(rowToIncident);
-  const avoid = others.map((o) => o.affected);
-  const plan = buildPlan({ incident, from: body.version, lockfile: body.lockfile, manager, direct: !!exposure.direct, pack: await getPackument(incident.package), avoid });
-  if (!plan) return c.json({ error: `No clean release of ${incident.package} was found to move to.` }, 422);
-
-  const id = shortId();
-  await env.DB.prepare("INSERT INTO runs (id, incident_id, repo_id, status, step, plan, started_at) VALUES (?, ?, ?, 'queued', 'plan', ?, ?)")
-    .bind(id, incident.id, repo.id, JSON.stringify(plan), now())
-    .run();
-  const start: StartRun = {
-    runId: id,
-    fullName: repo.fullName,
-    defaultBranch: repo.defaultBranch,
-    // The sandbox's lockfile check rejects any version flagged by any advisory for the package.
-    incident: {
-      id: incident.id,
-      kind: incident.kind,
-      title: incident.title,
-      package: incident.package,
-      affected: { versions: [incident.affected.versions, ...avoid.map((a) => a.versions)].flat(), ranges: [incident.affected.ranges, ...avoid.map((a) => a.ranges)].flat() },
-      sources: incident.sources,
-      severity: incident.severity,
-    },
-    plan,
-  };
-  const stub = env.FIX_RUN.get(env.FIX_RUN.idFromName(id));
-  await stub.fetch("https://run/start", { method: "POST", body: JSON.stringify(start) });
-  return c.json((await getRun(env, id)) as Run);
 });
 
 app.get("/runs/:id", async (c) => {
