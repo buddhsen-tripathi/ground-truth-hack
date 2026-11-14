@@ -4,6 +4,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { motion } from "motion/react";
 import { AddRepoForm } from "@/components/add-repo";
 import { ErrorNote, IncidentRow, MetricTile, RunRow } from "@/components/bits";
+import { Highlight } from "@/components/highlight";
 import { useCheckNow } from "@/components/shell";
 import { Badge, Button, buttonVariants, Card, CardHeader, Empty, RowsSkeleton, Skeleton, Spinner } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -76,7 +77,7 @@ function OverviewPage() {
           {data.repos === 0 ? (
             <>
               <h1 className="max-w-2xl text-[1.875rem] leading-[1.15] font-semibold tracking-[-0.025em] text-balance md:text-display-md">
-                From disclosure to a tested hotfix PR in minutes.
+                From disclosure to a <Highlight>tested</Highlight> hotfix PR in minutes.
               </h1>
               <p className="mt-3 max-w-xl text-[15px] leading-6 text-pretty text-muted-foreground">
                 Watch a repo. Firebreak reads every lockfile, checks each resolved version against OSV and fresh security news, and when you're hit, fixes it in a
@@ -89,9 +90,7 @@ function OverviewPage() {
           ) : exposed.length ? (
             <>
               <h1 className="max-w-3xl text-[1.875rem] leading-[1.15] font-semibold tracking-[-0.025em] text-balance md:text-display-md">
-                <span className="text-danger">
-                  {data.exposedRepos} repo{data.exposedRepos === 1 ? "" : "s"} exposed
-                </span>
+                {data.exposedRepos} repo{data.exposedRepos === 1 ? "" : "s"} <Highlight tone="danger">exposed</Highlight>
                 {exposedPackages > 1 ? ` across ${exposedPackages} packages.` : ` through ${exposed[0]!.package}.`}
               </h1>
               <p className="mt-3 max-w-xl text-[15px] leading-6 text-pretty text-muted-foreground">
@@ -108,7 +107,7 @@ function OverviewPage() {
           ) : (
             <>
               <h1 className="max-w-3xl text-[1.875rem] leading-[1.15] font-semibold tracking-[-0.025em] text-balance md:text-display-md">
-                All clear across {data.repos} repo{data.repos === 1 ? "" : "s"}.
+                <Highlight tone="success">All clear</Highlight> across {data.repos} repo{data.repos === 1 ? "" : "s"}.
               </h1>
               <p className="mt-3 max-w-xl text-[15px] leading-6 text-pretty text-muted-foreground">
                 {nf.format(data.deps)} resolved dependencies checked against OSV{data.watch.integrations.you ? " and today's security news" : ""}. Nothing you ship matches a

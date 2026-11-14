@@ -33,4 +33,5 @@ export const api = {
   run: (id: string) => req<{ run: Run; events: RunEvent[] }>(`/runs/${id}`),
   startRun: (body: { incidentId: string; repoId: string; lockfile: string; version: string }) => req<Run>("/runs", { method: "POST", body: JSON.stringify(body) }),
   openPr: (id: string) => req<{ url: string }>(`/runs/${id}/pr`, { method: "POST" }),
+  stopPreview: (id: string) => req<{ ok: true }>(`/runs/${id}/preview/stop`, { method: "POST" }),
 };

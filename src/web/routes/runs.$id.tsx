@@ -4,8 +4,11 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { RUN_STEPS, type Run, type RunEvent, type RunStep } from "@shared/types";
+import type { Run, RunEvent, RunStep } from "@shared/types";
 import { ErrorNote, RunStatusBadge } from "@/components/bits";
+import { Highlight } from "@/components/highlight";
+import { LivePreview } from "@/components/live-preview";
+import { PipelineGraph } from "@/components/pipeline-graph";
 import { Button, Card, CardHeader, LoadingState, Mono, Spinner, Tag } from "@/components/ui";
 import { api } from "@/lib/api";
 import { cn, duration } from "@/lib/utils";
@@ -38,7 +41,7 @@ function useRunEvents(id: string, live: boolean) {
     ws.onmessage = (m) => {
       const ev = JSON.parse(m.data as string) as RunEvent;
       setEvents((prev) => [...prev, ev]);
-      if (ev.type === "status") qc.invalidateQueries({ queryKey: ["run", id] });
+      if (ev.type === "status" || ev.type === "preview") qc.invalidateQueries({ queryKey: ["run", id] });
     };
     return () => ws.close();
   }, [id, qc]);
@@ -109,48 +112,6 @@ function Terminal({ events, live }: { events: RunEvent[]; live: boolean }) {
         {live ? <span className="inline-block h-4 w-2 animate-pulse bg-term-foreground/70 align-middle" /> : null}
       </div>
     </div>
-  );
-}
-
-function Stepper({ run, events }: { run: Run; events: RunEvent[] }) {
-  const seen = new Set(events.filter((e) => e.type === "step").map((e) => (e as { step: RunStep }).step));
-  seen.add(run.step);
-  const steps = RUN_STEPS.filter((s) => s !== "repair" || seen.has("repair"));
-  const currentIdx = steps.indexOf(run.step);
-  return (
-    <ol className="flex flex-wrap items-center gap-y-2" aria-label="Run steps">
-      {steps.map((s, i) => {
-        const done = i < currentIdx || (s === run.step && (run.status === "passed" || run.status === "pr_opened"));
-        const active = s === run.step && (run.status === "running" || run.status === "queued");
-        const failed = s === run.step && run.status === "failed";
-        return (
-          <li key={s} className="flex items-center">
-            <div
-              className={cn(
-                "flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors",
-                done && "text-foreground",
-                active && "bg-info-soft text-info",
-                failed && "bg-danger-soft text-danger",
-                !done && !active && !failed && "text-muted-foreground/60",
-              )}
-            >
-              <span
-                className={cn(
-                  "grid size-4 place-items-center rounded-full border border-border text-[9px]",
-                  done && "border-primary bg-primary text-primary-foreground",
-                  active && "border-info",
-                  failed && "border-destructive bg-destructive text-destructive-foreground",
-                )}
-              >
-                {done ? <Check weight="bold" className="size-2.5" /> : failed ? <X weight="bold" className="size-2.5" /> : active ? <Spinner className="size-3" /> : null}
-              </span>
-              {STEP_NAMES[s]}
-            </div>
-            {i < steps.length - 1 ? <span className={cn("mx-0.5 h-px w-3 sm:w-5", i < currentIdx ? "bg-primary" : "bg-border")} /> : null}
-          </li>
-        );
-      })}
-    </ol>
   );
 }
 
@@ -235,7 +196,13 @@ function RunPage() {
             {plan ? (
               <>
                 <span className="font-mono text-[0.85em]">{plan.package}</span> <span className="text-danger line-through decoration-2 opacity-80">{plan.from}</span>{" "}
-                <span className="text-muted-foreground">→</span> <span className="text-success">{plan.to}</span>
+                <span className="text-muted-foreground">→</span> {run.status === "passed" || run.status === "pr_opened" ? (
+                  <Highlight tone="success" serif={false} className="font-mono text-[0.85em]">
+                    {plan.to}
+                  </Highlight>
+                ) : (
+                  <span className="text-success">{plan.to}</span>
+                )}
               </>
             ) : (
               run.package
@@ -248,13 +215,14 @@ function RunPage() {
         <Elapsed run={run} />
       </div>
 
-      <Card className="mb-6 px-3 py-2.5">
-        <Stepper run={run} events={events} />
+      <Card className="mb-6 px-2 py-1 sm:px-4">
+        <PipelineGraph run={run} events={events} />
       </Card>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="min-w-0 space-y-6">
           <Terminal events={events} live={live} />
+          {result?.preview ? <LivePreview runId={run.id} preview={result.preview} /> : null}
           {result?.diff ? (
             <Card className="overflow-hidden">
               <CardHeader title="Diff" description={`${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"} changed · lockfile hunks hidden`} />
