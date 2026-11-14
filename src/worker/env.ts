@@ -4,6 +4,11 @@ export type AppEnv = Env & {
   CLONVO_API_KEY?: string;
   DAYTONA_API_KEY?: string;
   GITHUB_TOKEN?: string;
+  /** OpenCrawl agent access token (`opencrawl token create`): agent history search and the board. */
+  OPENCRAWL_TOKEN?: string;
+  OPENCRAWL_API_URL?: string;
+  /** Claude Code token (`claude setup-token`): runs Claude Code as the repair agent inside the sandbox. */
+  CLAUDE_CODE_OAUTH_TOKEN?: string;
   CLONVO_BASE_URL: string;
   DAYTONA_API_URL: string;
   FIX_MODEL: string;

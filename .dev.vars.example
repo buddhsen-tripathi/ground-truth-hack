@@ -12,3 +12,10 @@ DAYTONA_API_KEY=
 # GitHub fine-grained PAT, scoped to the demo repos only.
 # Repository permissions: Contents (read & write), Pull requests (read & write), Actions (read), Metadata (read)
 GITHUB_TOKEN=
+
+# Optional: OpenCrawl agent token (`opencrawl token create --name firebreak --env-file .dev.vars`).
+# Runs read and post notes on the OpenCrawl board and search agent history before repairing; Claude Code gets it over MCP.
+OPENCRAWL_TOKEN=
+# Optional: Claude Code token (`claude setup-token`). When set, Claude Code runs in the sandbox as the repair agent
+# instead of the Clonvo edit loop. Project code in the sandbox can see it while the agent runs.
+CLAUDE_CODE_OAUTH_TOKEN=

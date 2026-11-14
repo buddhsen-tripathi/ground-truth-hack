@@ -31,7 +31,14 @@ async function watchStatus(env: AppEnv): Promise<WatchStatus> {
           errors: JSON.parse((last.errors as string) || "[]") as string[],
         }
       : null,
-    integrations: { you: !!env.YOU_API_KEY, clonvo: !!env.CLONVO_API_KEY, daytona: !!env.DAYTONA_API_KEY, github: !!env.GITHUB_TOKEN },
+    integrations: {
+      you: !!env.YOU_API_KEY,
+      clonvo: !!env.CLONVO_API_KEY,
+      daytona: !!env.DAYTONA_API_KEY,
+      github: !!env.GITHUB_TOKEN,
+      opencrawl: !!env.OPENCRAWL_TOKEN,
+      claudeCode: !!env.CLAUDE_CODE_OAUTH_TOKEN,
+    },
     models: { fix: env.FIX_MODEL, extract: env.EXTRACT_MODEL },
   };
 }

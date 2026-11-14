@@ -1,15 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
-import { planPackages, type FixPlan, type Incident, type LockfileFix, type RunAttempt, type RunEvent, type RunEventInput, type RunPreview, type RunResult, type RunStatus, type RunStep, type Source } from "@shared/types";
+import { planPackages, type RepairAgent, type FixPlan, type Incident, type LockfileFix, type RunAttempt, type RunEvent, type RunEventInput, type RunPreview, type RunResult, type RunStatus, type RunStep, type Source } from "@shared/types";
 import { now, type AppEnv } from "../env";
 import { normalizePlan } from "../db";
 import { chat, parseJsonReply } from "../integrations/clonvo";
 import { Sandbox } from "../integrations/daytona";
 import { openPullRequest } from "../integrations/github";
 import { search } from "../integrations/you";
+import { boardSync, opencrawlApi, opencrawlEnabled, packageTopic, repoTopic, searchHistory } from "../integrations/opencrawl";
 import { parseLockfile } from "../lockfiles";
 import { parseDocument } from "yaml";
 import { isAffected } from "../versions";
-import { APPLY_EDITS, PATCH_PACKAGE_JSON, PATCH_PYTHON } from "./scripts";
+import { APPLY_EDITS, CLAUDE_FILTER, PATCH_PACKAGE_JSON, PATCH_PYTHON, SCAN_WORKSPACE } from "./scripts";
 
 const SESSION = "firebreak";
 const MAX_REPAIRS = 3;
@@ -19,7 +20,10 @@ const TEST_TIMEOUT = 600;
 const PREVIEW_PORT = 3000;
 /** How long the sandbox stays up for the live preview after a verified fix. */
 const PREVIEW_TTL_SEC = 30 * 60;
-const PREVIEW_BOOT_SEC = 120;
+const PREVIEW_BOOT_SEC = 150;
+/** Claude Code gets one bounded session per repair round; the checks are re-run independently afterwards. */
+const AGENT_TIMEOUT_SEC = 12 * 60;
+const AGENT_MAX_TURNS = 40;
 
 type Phase = "sandbox" | "clone" | "patch" | "install" | "verify" | "test" | "repair" | "preview" | "previewing" | "ready" | "done";
 
@@ -66,6 +70,12 @@ interface State extends StartRun {
   changedFiles: string[];
   agentNotes: string[];
   migrationSources: Source[];
+  /** Notes other runs and agents left on this run's OpenCrawl board topics. */
+  boardNotes: string[];
+  history?: { found: number; board: number };
+  agent?: RepairAgent;
+  /** Lockfile → expo-doctor / `expo install --check` output: informs the agent, never gates the run. */
+  expoNotes: Record<string, string>;
   error?: string;
   prUrl?: string;
   preview?: RunPreview;
@@ -124,6 +134,10 @@ export class FixRun extends DurableObject<AppEnv> {
         raw.pyCompile ??= {};
         raw.cursor ??= 0;
       }
+      if (raw) {
+        raw.boardNotes ??= [];
+        raw.expoNotes ??= {};
+      }
       this.st = raw;
     }
     if (!this.st) throw new Error("Run not started");
@@ -164,6 +178,8 @@ export class FixRun extends DurableObject<AppEnv> {
       durationMs: s.verifiedMs ?? Date.now() - s.startedAt,
       error: s.error,
       preview: s.preview,
+      agent: s.agent,
+      history: s.history,
     };
   }
 
@@ -233,6 +249,8 @@ export class FixRun extends DurableObject<AppEnv> {
         changedFiles: [],
         agentNotes: [],
         migrationSources: [],
+        boardNotes: [],
+        expoNotes: {},
       };
       await this.save();
       this.emit({ type: "step", step: "plan", label: STEP_LABELS.plan });
@@ -258,7 +276,10 @@ export class FixRun extends DurableObject<AppEnv> {
       try {
         return Response.json({ url: await this.openPr() });
       } catch (e) {
-        return Response.json({ error: (e as Error).message }, { status: 500 });
+        const message = (e as Error).message;
+        // Say why in the run's log too, so a retried click doesn't just repeat "Opening the pull request…".
+        this.emit({ type: "log", stream: "err", text: `Pull request not opened: ${message}` });
+        return Response.json({ error: message }, { status: 500 });
       }
     }
     return new Response("Not found", { status: 404 });
@@ -303,6 +324,7 @@ export class FixRun extends DurableObject<AppEnv> {
     s.phase = "done";
     this.emit({ type: "log", stream: "err", text: message });
     await this.setStatus("failed");
+    await this.postBoard(s, false);
     if (s.sandboxId) {
       const sb = await Sandbox.attach(this.env, s.sandboxId).catch(() => null);
       await sb?.delete();
@@ -378,11 +400,14 @@ export class FixRun extends DurableObject<AppEnv> {
     const python = targets.some((t) => t.ecosystem === "PyPI");
     switch (s.phase) {
       case "sandbox": {
+        await this.readBoard(s);
         await this.step("sandbox");
         const sb = await Sandbox.create(this.env, { run: s.runId });
         s.sandboxId = sb.id;
         await this.save();
-        this.info(`Sandbox ${sb.id} created. No secrets are passed in.`);
+        this.info(
+          `Sandbox ${sb.id} created. No secrets are passed in${this.env.CLAUDE_CODE_OAUTH_TOKEN ? " unless checks fail: then Claude Code gets its own token, after every lockfile is verified clean" : ""}.`,
+        );
         await sb.waitStarted();
         s.home = (await sb.exec("echo $HOME")).output.trim() || "/home/daytona";
         await this.save();
@@ -473,7 +498,8 @@ export class FixRun extends DurableObject<AppEnv> {
         if (/^Killed$|exit code 137|JavaScript heap out of memory|MemoryError/m.test(r.output.slice(-4000)))
           throw new Error("Checks were killed for running out of memory in the sandbox. Use a larger DAYTONA_SNAPSHOT. No PR will be offered.");
         if (s.repairs >= MAX_REPAIRS) throw new Error(`Checks still failing after ${MAX_REPAIRS} repair attempts. No PR will be offered.`);
-        if (!this.env.CLONVO_API_KEY) throw new Error("Checks failed and CLONVO_API_KEY is not set, so the agent can't attempt a repair.");
+        if (!this.env.CLAUDE_CODE_OAUTH_TOKEN && !this.env.CLONVO_API_KEY)
+          throw new Error("Checks failed and neither CLAUDE_CODE_OAUTH_TOKEN nor CLONVO_API_KEY is set, so no agent can attempt a repair.");
         return "repair";
       }
 
@@ -570,14 +596,33 @@ export class FixRun extends DurableObject<AppEnv> {
     if (r.exitCode !== 0) throw new Error(`Install failed in ${t.dir || "the repo root"} (exit ${r.exitCode ?? "timeout"})`);
   }
 
+  /** Every package.json in a lockfile's project, with its scripts and web-framework dependencies. */
+  private async workspace(sb: Sandbox, s: State, t: LockfileFix): Promise<WorkspacePackage[]> {
+    await sb.writeFile("/tmp/fb-scan.cjs", SCAN_WORKSPACE);
+    const r = await sb.exec(`node /tmp/fb-scan.cjs ${shq(this.dirPath(s, t))}`, { timeoutSec: 60 });
+    try {
+      return JSON.parse(r.output.trim().split("\n").pop() ?? "[]") as WorkspacePackage[];
+    } catch {
+      return [];
+    }
+  }
+
   private async npmTestCommand(sb: Sandbox, s: State, t: LockfileFix): Promise<string> {
     const raw = await sb.readFile(this.dirPath(s, t, "package.json"));
     const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
     const runner = t.manager === "npm" ? "npm run" : `${t.manager} run`;
+    const expoApps = (await this.workspace(sb, s, t)).filter((p) => p.deps.includes("expo")).slice(0, 2);
     const parts: string[] = [];
     for (const name of ["typecheck", "type-check"]) if (scripts[name]) { parts.push(`${runner} ${name}`); break; }
-    if (scripts.test && !/no test specified/.test(scripts.test)) parts.push(t.manager === "npm" ? "npm test" : `${t.manager} run test`);
-    else if (scripts.build) parts.push(`${runner} build`);
+    // Expo apps: a type check, a Metro bundle and the tests decide. Their `build` script is usually `eas build`, which needs an Expo login.
+    if (!parts.length) for (const app of expoApps) if (app.tsconfig) parts.push(`(cd ${shq(app.dir || ".")} && npx tsc --noEmit)`);
+    if (scripts.test && !/no test specified/.test(scripts.test)) {
+      const base = t.manager === "npm" ? "npm test" : `${t.manager} run test`;
+      // The Expo template's test script is `jest --watchAll`, which never exits.
+      parts.push(/--watch(All)?\b/.test(scripts.test) ? `${base}${t.manager === "npm" ? " --" : ""} --watchAll=false` : base);
+    } else if (scripts.build && !expoApps.length) parts.push(`${runner} build`);
+    expoApps.forEach((app, i) => parts.push(`(cd ${shq(app.dir || ".")} && EXPO_NO_TELEMETRY=1 npx expo export --platform ios --output-dir /tmp/fb-export-${i})`));
+    if (expoApps.length) await this.expoDoctor(sb, s, t, expoApps);
     if (parts.length) {
       this.info(`Checks for ${t.lockfile}: ${parts.join(" && ")}`);
       return parts.join(" && ");
@@ -585,6 +630,30 @@ export class FixRun extends DurableObject<AppEnv> {
     this.info(`No test, typecheck or build script for ${t.lockfile}; confirming the installed versions only.`);
     const names = JSON.stringify(t.packages.map((p) => p.package));
     return `node -p ${shq(`${names}.map(n => n + " " + require("./node_modules/" + n + "/package.json").version).join("\\n")`)}`;
+  }
+
+  /** expo-doctor and `expo install --check`: reported and handed to the agent, never pass/fail. */
+  private async expoDoctor(sb: Sandbox, s: State, t: LockfileFix, apps: WorkspacePackage[]): Promise<void> {
+    const notes: string[] = [];
+    for (const app of apps) {
+      const dir = this.dirPath(s, t, app.dir);
+      const where = app.dir || "the repo root";
+      for (const [tool, cmd] of [
+        ["expo.install", "npx expo install --check"],
+        ["expo.doctor", "npx -y expo-doctor@latest"],
+      ] as const) {
+        const r = await sb.exec(`cd ${dir} && EXPO_NO_TELEMETRY=1 CI=1 timeout 150 ${cmd} 2>&1 | tail -c 2500`, { timeoutSec: 170 }).catch(() => null);
+        if (!r) continue;
+        const text = r.output.trim();
+        const ok = r.exitCode === 0;
+        const first = text.split("\n").find((l) => /\d+\/\d+ checks|up to date|should be updated|issues? (were )?found|checks? failed|Dependencies are up to date/i.test(l)) ?? (ok ? "No problems found" : text.split("\n").pop() ?? "");
+        this.emit({ type: "tool", tool, text: `${app.name || where}: ${first.trim().slice(0, 200)}` });
+        if (!ok && text) notes.push(`$ ${cmd} (in ${where})\n${text}`);
+      }
+    }
+    s.expoNotes[t.lockfile] = notes.join("\n\n").slice(0, 5000);
+    const sdk = t.expoSdk ? ` SDK ${t.expoSdk}` : "";
+    this.info(`Expo${sdk} app${apps.length === 1 ? "" : "s"} found (${apps.map((a) => a.dir || ".").join(", ")}): checks are a type check, a Metro bundle and the tests. expo-doctor findings are passed to the agent, not counted as failures.`);
   }
 
   // ── Python: uv and pinned requirements ────────────────────────────────────────────────────────────
@@ -735,15 +804,7 @@ export class FixRun extends DurableObject<AppEnv> {
         .filter((f) => !f.includes("node_modules"))
         .map((f) => (t.dir && !f.startsWith(t.dir) ? `${t.dir}/${f}` : f));
     }
-    const grep = await sb.exec(grepCmd);
-    const files = [...new Set([...grep.output.split("\n").map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean), ...new Set(fromError.slice(0, 6))])].slice(0, 10);
-    const contents: string[] = [];
-    for (const f of files) {
-      const text = await sb.readFile(this.repoPath(s, f));
-      if (text !== null) contents.push(`--- ${f}\n${text.slice(0, 15_000)}`);
-    }
     const changes = t.packages.map((p) => `${p.package} ${p.from.join("/")} → ${p.to}`);
-    this.emit({ type: "agent", text: `Reading ${contents.length} file${contents.length === 1 ? "" : "s"} that use ${t.packages.map((p) => p.package).join(", ")} or appear in the failure.` });
 
     // Migration notes for the bump most likely behind the failure: one named in the output, else the first.
     const suspect = t.packages.find((p) => failure.toLowerCase().includes(p.package.toLowerCase())) ?? t.packages[0]!;
@@ -756,14 +817,25 @@ export class FixRun extends DurableObject<AppEnv> {
           .join("\n\n")
           .slice(0, 10_000);
         for (const r of results.slice(0, 3)) if (!s.migrationSources.some((m) => m.url === r.url)) s.migrationSources.push({ kind: "news", title: r.title, url: r.url });
-        this.emit({ type: "agent", text: `Pulled ${suspect.package} migration notes from ${results.length} sources via You.com.` });
+        this.emit({ type: "tool", tool: "you.search", text: `${suspect.package} ${suspect.to} migration notes: ${results.length} sources` });
       } catch (e) {
         this.info(`Migration search skipped: ${(e as Error).message}`);
       }
     }
 
+    const history = await this.historyNotes(s, suspect, failure);
     const language = python ? "Python" : "JavaScript/TypeScript";
     const manifests = python ? "lockfiles, pyproject.toml, requirements files, virtualenvs" : "lockfiles, package.json, node_modules";
+    if (this.env.CLAUDE_CODE_OAUTH_TOKEN) return this.claudeRepair(sb, s, t, { failure, notes, history, suspect: suspect.package, language, manifests });
+    s.agent = "clonvo";
+    const grep = await sb.exec(grepCmd);
+    const files = [...new Set([...grep.output.split("\n").map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean), ...new Set(fromError.slice(0, 6))])].slice(0, 10);
+    const contents: string[] = [];
+    for (const f of files) {
+      const text = await sb.readFile(this.repoPath(s, f));
+      if (text !== null) contents.push(`--- ${f}\n${text.slice(0, 15_000)}`);
+    }
+    this.emit({ type: "agent", text: `Reading ${contents.length} file${contents.length === 1 ? "" : "s"} that use ${t.packages.map((p) => p.package).join(", ")} or appear in the failure.` });
     const reply = await chat(
       this.env,
       this.env.FIX_MODEL,
@@ -774,7 +846,7 @@ export class FixRun extends DurableObject<AppEnv> {
         },
         {
           role: "user",
-          content: `Dependency changes in ${t.lockfile} (${t.manager}):\n${changes.join("\n")}\nCommand: ${s.tests[t.lockfile]}\n\nFailure output (tail):\n${failure}\n\nMigration notes (${suspect.package}):\n${notes || "(none)"}\n\nFiles (paths relative to the repo root):\n${contents.join("\n\n") || "(none found)"}\n\nReply as {"explanation":"one or two sentences","edits":[{"path":"src/file.ext","find":"exact old text","replace":"new text"}]}. Use an empty edits list if the failure is unrelated to the upgrades.`,
+          content: `Dependency changes in ${t.lockfile} (${t.manager}):\n${changes.join("\n")}\nCommand: ${s.tests[t.lockfile]}\n\nFailure output (tail):\n${failure}\n\nMigration notes (${suspect.package}):\n${notes || "(none)"}\n\n${history ? `How earlier agent sessions handled this (OpenCrawl):\n${history}\n\n` : ""}${s.expoNotes[t.lockfile] ? `expo-doctor (informational):\n${s.expoNotes[t.lockfile]}\n\n` : ""}Files (paths relative to the repo root):\n${contents.join("\n\n") || "(none found)"}\n\nReply as {"explanation":"one or two sentences","edits":[{"path":"src/file.ext","find":"exact old text","replace":"new text"}]}. Use an empty edits list if the failure is unrelated to the upgrades.`,
         },
       ],
       { maxTokens: 6000 },
@@ -799,6 +871,232 @@ export class FixRun extends DurableObject<AppEnv> {
     if (!report.some((i) => i.ok)) throw new Error("None of the agent's edits applied cleanly.");
   }
 
+  // ── OpenCrawl: shared agent history and the board other runs post to ─────────────────────────────
+
+  private boardTopics(s: State): string[] {
+    const packages = s.plan.targets.flatMap((t) => t.packages.map((p) => packageTopic(t.ecosystem, p.package)));
+    return [repoTopic(s.fullName), ...new Set(packages)].slice(0, 8);
+  }
+
+  private agentName(s: State) {
+    return `firebreak-${s.runId}`;
+  }
+
+  /** Reads what other runs and agents posted about this repo and these packages, so this run starts from it. */
+  private async readBoard(s: State): Promise<void> {
+    if (!opencrawlEnabled(this.env)) return;
+    const topics = this.boardTopics(s);
+    try {
+      const msgs = (await boardSync(this.env, this.agentName(s), topics)).filter((m) => m.name !== this.agentName(s));
+      s.boardNotes = msgs.slice(-12).map((m) => `[${m.topic}] ${m.name}: ${m.text}`);
+      s.history = { found: s.history?.found ?? 0, board: msgs.length };
+      await this.save();
+      this.emit({
+        type: "tool",
+        tool: "opencrawl.board",
+        text: msgs.length
+          ? `${msgs.length} note${msgs.length === 1 ? "" : "s"} from other runs on ${topics.length} topic${topics.length === 1 ? "" : "s"}`
+          : `No notes yet on ${topics.length} topic${topics.length === 1 ? "" : "s"} (${topics[0]}…). This run will leave one.`,
+      });
+      for (const m of msgs.slice(-4)) this.emit({ type: "tool", tool: "opencrawl.board", text: `${m.name}: ${m.text.slice(0, 220)}` });
+    } catch (e) {
+      this.info(`OpenCrawl board skipped: ${(e as Error).message.slice(0, 200)}`);
+    }
+  }
+
+  /** Leaves the outcome on the repo topic and the first package topics, for the next run or agent that touches them. */
+  private async postBoard(s: State, ok: boolean): Promise<void> {
+    if (!opencrawlEnabled(this.env)) return;
+    const all = planPackages(s.plan);
+    const bumps = all.map((p) => `${p.package} ${p.from.at(-1)}→${p.to}`).join(", ");
+    const how = s.agentNotes.length ? ` Agent: ${s.agentNotes.at(-1)}` : s.repairs ? "" : " No source changes needed.";
+    const summary = ok
+      ? `${s.fullName}: verified ${bumps}. Checks: ${Object.values(s.tests).join(" · ") || "n/a"}.${how}`
+      : `${s.fullName}: failed bumping ${bumps}. ${s.error ?? ""}${how}`;
+    const posts = [
+      { id: `${s.runId}-repo`, topic: repoTopic(s.fullName), text: summary },
+      ...s.plan.targets
+        .flatMap((t) => t.packages.map((p) => ({ t, p })))
+        .slice(0, 2)
+        .map(({ t, p }) => ({
+          id: `${s.runId}-${p.package}`.slice(0, 80),
+          topic: packageTopic(t.ecosystem, p.package),
+          text: `${p.package} ${p.from.at(-1)}→${p.to} in ${s.fullName} (${t.manager}${t.expoSdk ? `, Expo SDK ${t.expoSdk}` : ""}): ${ok ? "checks pass" : "failed"}.${how}`,
+        })),
+    ];
+    try {
+      await boardSync(this.env, this.agentName(s), this.boardTopics(s), posts);
+      this.emit({ type: "tool", tool: "opencrawl.board", text: `Posted the outcome to ${posts.length} topic${posts.length === 1 ? "" : "s"} for other runs and agents` });
+    } catch (e) {
+      this.info(`OpenCrawl post skipped: ${(e as Error).message.slice(0, 200)}`);
+    }
+  }
+
+  /** Searches captured agent sessions for earlier work on this package and failure. */
+  private async historyNotes(s: State, suspect: { package: string; to: string }, failure: string): Promise<string> {
+    const board = s.boardNotes.length ? `Board notes from other runs:\n${s.boardNotes.join("\n")}` : "";
+    if (!opencrawlEnabled(this.env)) return board;
+    // Lexical search: a short, distinctive query works best; the error code if there is one, else the package.
+    const code = /\b(TS\d{4}|ERR_[A-Z_]+|[A-Z][a-zA-Z]+Error)\b/.exec(failure)?.[1];
+    const queries = [suspect.package, ...(code ? [`${suspect.package} ${code}`] : [])];
+    const hits: string[] = [];
+    for (const q of queries) {
+      try {
+        const found = await searchHistory(this.env, q, 4);
+        this.emit({ type: "tool", tool: "opencrawl.search", text: `"${q}": ${found.length} passage${found.length === 1 ? "" : "s"} in agent history` });
+        for (const h of found) if (h.text) hits.push(`- ${h.title} (${h.source}): ${h.text}`);
+      } catch (e) {
+        this.info(`OpenCrawl search skipped: ${(e as Error).message.slice(0, 200)}`);
+        break;
+      }
+    }
+    s.history = { found: (s.history?.found ?? 0) + hits.length, board: s.history?.board ?? 0 };
+    return [hits.join("\n").slice(0, 6000), board].filter(Boolean).join("\n\n");
+  }
+
+  // ── Claude Code as the repair agent ───────────────────────────────────────────────────────────────
+
+  private async ensureClaude(sb: Sandbox): Promise<void> {
+    const r = await this.run(
+      sb,
+      `(command -v claude || npm i -g --prefix ~/.local @anthropic-ai/claude-code || (curl -fsSL https://claude.ai/install.sh | bash)) >/dev/null 2>&1; claude --version`,
+      240,
+      "claude --version",
+    );
+    if (r.exitCode !== 0) throw new Error("Could not install Claude Code in the sandbox");
+  }
+
+  /**
+   * Runs Claude Code headless in the project with the failure, migration notes and OpenCrawl history. It can read,
+   * edit and re-run the checks itself, and reach OpenCrawl over MCP to search history and post to the board.
+   * The tokens are written to a file the command sources and deletes, and never appear in the run log.
+   */
+  private async claudeRepair(
+    sb: Sandbox,
+    s: State,
+    t: LockfileFix,
+    ctx: { failure: string; notes: string; history: string; suspect: string; language: string; manifests: string },
+  ): Promise<void> {
+    s.agent = "claude-code";
+    await this.ensureClaude(sb);
+    const oc = this.env.OPENCRAWL_TOKEN;
+    const secrets = [this.env.CLAUDE_CODE_OAUTH_TOKEN!, ...(oc ? [oc] : [])];
+    await sb.writeFile(
+      "/tmp/fb-agent.env",
+      [`export CLAUDE_CODE_OAUTH_TOKEN=${shq(secrets[0]!)}`, ...(oc ? [`export OPENCRAWL_TOKEN=${shq(oc)}`] : [])].join("\n") + "\n",
+    );
+    if (oc)
+      await sb.writeFile(
+        "/tmp/fb-mcp.json",
+        JSON.stringify({ mcpServers: { opencrawl: { type: "http", url: `${opencrawlApi(this.env)}/mcp`, headers: { Authorization: "Bearer ${OPENCRAWL_TOKEN}" } } } }),
+      );
+    await sb.writeFile("/tmp/fb-claude-filter.cjs", CLAUDE_FILTER);
+    const command = s.tests[t.lockfile]!;
+    const changes = t.packages.map((p) => `- ${p.package} ${p.from.join("/")} → ${p.to} (${p.strategy})`).join("\n");
+    const topic = packageTopic(t.ecosystem, ctx.suspect);
+    const prompt = [
+      `Firebreak bumped dependencies in ${s.fullName} to clear security advisories, and the project's checks now fail. Make them pass.`,
+      ``,
+      `Project directory: ${this.dirPath(s, t)} (lockfile ${t.lockfile}, ${t.manager}${t.expoSdk ? `, Expo SDK ${t.expoSdk} app` : ""}).`,
+      `Dependency changes:\n${changes}`,
+      `Failing check, run from the project directory: ${command}`,
+      ``,
+      `Failure output (tail):\n${ctx.failure.slice(-5000)}`,
+      ...(ctx.notes ? [``, `Migration notes for ${ctx.suspect} (You.com):\n${ctx.notes.slice(0, 5000)}`] : []),
+      ...(ctx.history ? [``, `Earlier agent work on this (OpenCrawl history and board):\n${ctx.history}`] : []),
+      ...(s.expoNotes[t.lockfile] ? [``, `expo-doctor output (informational; fix only what the bump caused):\n${s.expoNotes[t.lockfile]}`] : []),
+      ``,
+      `Rules:`,
+      `- Make the smallest ${ctx.language} source changes that make the check pass, and keep the new dependency versions.`,
+      `- Don't edit ${ctx.manifests}. Don't install, add, remove or upgrade packages: dependencies are already installed with lifecycle scripts disabled.`,
+      `- Don't delete, skip or loosen tests to hide a failure.`,
+      `- Don't commit, push or touch git config. Leave the changes in the working tree.`,
+      `- Re-run the failing check to confirm before you stop. If the failure has nothing to do with the bump, say so and change nothing.`,
+      ...(oc
+        ? [
+            `- OpenCrawl tools are available (MCP server "opencrawl"). Search agent history for this package or error before guessing.`,
+            `  When done, call board_topics for the workspace id and post one short board_sync note on topic "${topic}" (agent "${this.agentName(s)}") saying what broke and what you changed, so other runs fixing ${ctx.suspect} can reuse it.`,
+          ]
+        : []),
+      ``,
+      `End with one or two plain sentences: what broke and what you changed.`,
+    ].join("\n");
+    await sb.writeFile("/tmp/fb-prompt.md", prompt);
+
+    const flags = `--output-format stream-json --verbose --dangerously-skip-permissions --max-turns ${AGENT_MAX_TURNS}${oc ? " --mcp-config /tmp/fb-mcp.json" : ""}`;
+    const display = `claude -p <repair brief> ${flags.replace(" --mcp-config /tmp/fb-mcp.json", " --mcp-config opencrawl")}`;
+    this.emit({ type: "cmd", command: display });
+    this.emit({ type: "tool", tool: "claude.start", text: `Claude Code is repairing ${t.dir || "the repo root"} (up to ${AGENT_MAX_TURNS} turns, ${AGENT_TIMEOUT_SEC / 60} min)` });
+    const started = Date.now();
+    const cmdId = await sb.startCommand(
+      SESSION,
+      `cd ${this.dirPath(s, t)} && . /tmp/fb-agent.env && rm -f /tmp/fb-agent.env && IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 claude -p "$(cat /tmp/fb-prompt.md)" ${flags} 2>/tmp/fb-claude.err | node /tmp/fb-claude-filter.cjs`,
+    );
+    const redact = (x: string) => secrets.reduce((acc, sec) => (sec ? acc.split(sec).join("***") : acc), x);
+    let consumed = 0;
+    type AgentResult = { ok: boolean; subtype?: string; text: string; turns?: number; cost?: number };
+    let result: AgentResult | null = null;
+    let exitCode: number | null = null;
+    let edits = 0;
+    const handle = (line: string) => {
+      let e: { k: string; [k: string]: unknown };
+      try {
+        e = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const text = redact(String(e.text ?? ""));
+      if (e.k === "init") {
+        const mcp = (e.mcp as string[] | undefined) ?? [];
+        this.emit({ type: "tool", tool: "claude.init", text: `${String(e.model ?? "Claude")} · ${e.tools} tools${mcp.length ? ` · MCP ${mcp.join(", ")}` : ""}` });
+      } else if (e.k === "text") this.emit({ type: "agent", text });
+      else if (e.k === "tool") {
+        const name = String(e.tool ?? "");
+        const tool = name.startsWith("mcp__opencrawl__")
+          ? `opencrawl.${name.slice("mcp__opencrawl__".length).replace(/^board_.*/, "board")}`
+          : `claude.${name}`;
+        if (/^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) edits++;
+        this.emit({ type: "tool", tool, text });
+      } else if (e.k === "toolerr") this.emit({ type: "log", stream: "err", text: `tool error: ${text}` });
+      else if (e.k === "result") result = { ok: !!e.ok, subtype: e.subtype as string | undefined, text, turns: e.turns as number, cost: e.cost as number };
+    };
+    while (Date.now() - started < AGENT_TIMEOUT_SEC * 1000) {
+      await sleep(2500);
+      exitCode = await sb.commandStatus(SESSION, cmdId).catch(() => null);
+      const out = await sb.commandLogs(SESSION, cmdId).catch(() => null);
+      if (out && out.length > consumed) {
+        const end = exitCode !== null ? out.length : out.lastIndexOf("\n") + 1;
+        if (end > consumed) {
+          for (const line of out.slice(consumed, end).split("\n")) if (line.trim()) handle(line);
+          consumed = end;
+        }
+      }
+      if (exitCode !== null) break;
+    }
+    if (exitCode === null) {
+      await sb.exec("pkill -f 'claude -p' || true").catch(() => undefined);
+      this.emit({ type: "log", stream: "err", text: `Claude Code stopped after ${AGENT_TIMEOUT_SEC / 60} minutes.` });
+    }
+    await sb.exec("rm -f /tmp/fb-agent.env /tmp/fb-mcp.json").catch(() => undefined);
+    const r = result as AgentResult | null;
+    this.emit({ type: "exit", command: display, exitCode: r?.ok ? 0 : (exitCode ?? null), ms: Date.now() - started });
+    if (!r) {
+      const err = redact((await sb.exec("tail -c 1500 /tmp/fb-claude.err").catch(() => ({ output: "" }))).output.trim());
+      if (/401|invalid.*(api key|token)|authentication|OAuth/i.test(err))
+        throw new Error("Claude Code couldn't sign in with CLAUDE_CODE_OAUTH_TOKEN. Run `claude setup-token` and update the secret.");
+      if (exitCode !== null) throw new Error(`Claude Code exited without a result${err ? `: ${err.slice(-400)}` : ""}`);
+    } else {
+      const facts = [r.turns ? `${r.turns} turns` : "", edits ? `${edits} edit${edits === 1 ? "" : "s"}` : "", r.cost ? `$${r.cost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
+      this.emit({ type: "tool", tool: "claude.result", text: `${r.ok ? "Finished" : `Stopped (${r.subtype ?? "error"})`}${facts ? ` · ${facts}` : ""}` });
+      if (/401|invalid.*(api key|token)|OAuth token/i.test(r.text) && !edits)
+        throw new Error("Claude Code couldn't sign in with CLAUDE_CODE_OAUTH_TOKEN. Run `claude setup-token` and update the secret.");
+      if (r.text) s.agentNotes.push(r.text.slice(0, 500));
+    }
+    // The agent had a shell: re-check that it left the lockfiles as verified before the checks run again.
+    for (const target of s.plan.targets) await this.checkLockfile(sb, s, target);
+    if (!edits) throw new Error("Claude Code made no source change for this failure. No PR will be offered.");
+  }
+
   private async finishReady(sb: Sandbox, s: State): Promise<Phase> {
     const status = await sb.exec(`cd ${this.repoPath(s)} && git status --porcelain`);
     s.changedFiles = status.output
@@ -816,29 +1114,25 @@ export class FixRun extends DurableObject<AppEnv> {
     s.verifiedMs = Date.now() - s.startedAt;
     await this.save();
     await this.setStatus("passed", "ready");
+    await this.postBoard(s, true);
     this.info("Fix verified. Review the receipt, then open the PR when you're ready. Starting a live preview of the patched app…");
     return "preview";
   }
 
   // ── live preview (after a verified fix) ───────────────────────────────────────────────────────────
 
-  /** Picks a JS project's script that serves the app and adds flags so it listens on PREVIEW_PORT on every interface. */
-  private async previewCommand(sb: Sandbox, s: State): Promise<{ command: string; target: LockfileFix } | null> {
+  /** Finds a web app in the changed JS projects (workspace packages included) and the command that serves it on PREVIEW_PORT. */
+  private async previewCommand(sb: Sandbox, s: State): Promise<{ command: string; dir: string; framework: string } | null> {
+    const found: { command: string; dir: string; framework: string; score: number; depth: number }[] = [];
     for (const t of s.plan.targets) {
       if (t.ecosystem !== "npm") continue;
-      const raw = await sb.readFile(this.dirPath(s, t, "package.json"));
-      const scripts = (raw ? (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts : undefined) ?? {};
-      const name = ["dev", "start", "preview"].find((n) => scripts[n] && !/^\s*(echo|exit)\b/.test(scripts[n]!));
-      if (!name) continue;
-      const script = scripts[name]!;
-      const run = t.manager === "npm" ? `npm run ${name} --` : `${t.manager} run ${name}`;
-      const port = String(PREVIEW_PORT);
-      if (/\bnext\b/.test(script)) return { target: t, command: `${run} -H 0.0.0.0 -p ${port}` };
-      if (/\b(vite|astro|react-router|remix|nuxt|svelte-kit|vinext)\b/.test(script) && !/\bvitest\b/.test(script)) return { target: t, command: `${run} --host 0.0.0.0 --port ${port}` };
-      if (/\bwrangler\b/.test(script)) return { target: t, command: `${run} --ip 0.0.0.0 --port ${port}` };
-      return { target: t, command: t.manager === "npm" ? `npm run ${name}` : `${t.manager} run ${name}` };
+      for (const pkg of await this.workspace(sb, s, t)) {
+        const pick = webCommand(pkg, t.manager);
+        if (pick) found.push({ ...pick, dir: this.dirPath(s, t, pkg.dir), depth: pkg.dir ? pkg.dir.split("/").length : 0 });
+      }
     }
-    return null;
+    found.sort((a, b) => b.score - a.score || a.depth - b.depth);
+    return found[0] ?? null;
   }
 
   private async startPreview(s: State): Promise<Phase> {
@@ -846,13 +1140,15 @@ export class FixRun extends DurableObject<AppEnv> {
     const picked = await this.previewCommand(sb, s);
     if (!picked) {
       const note = s.plan.targets.some((t) => t.ecosystem === "npm")
-        ? "No dev, start or preview script in package.json, so there is nothing to serve."
+        ? "No web app found to serve. Looked for Next.js, Vite, Astro, Remix, React Router, Nuxt, SvelteKit, Wrangler and Expo web (with react-native-web) dev scripts."
         : "Live preview covers JavaScript apps with a dev, start or preview script; this run only changed Python projects.";
       await this.endPreview(s, note, "unavailable");
       return "ready";
     }
-    const { command, target } = picked;
-    await this.setPreview(s, { state: "starting", command, port: PREVIEW_PORT });
+    const { command, dir, framework } = picked;
+    const rel = dir.slice(this.repoPath(s).length + 1);
+    this.info(`Serving the ${framework} app${rel ? ` in ${rel}` : ""}.`);
+    await this.setPreview(s, { state: "starting", command, port: PREVIEW_PORT, framework, dir: rel || undefined });
     const signed = await sb.signedPreviewUrl(PREVIEW_PORT, PREVIEW_TTL_SEC);
     const host = new URL(signed.url).hostname;
     // Vite refuses unknown Host headers in dev; allow the preview proxy's domain.
@@ -860,7 +1156,7 @@ export class FixRun extends DurableObject<AppEnv> {
     this.emit({ type: "cmd", command });
     await sb.startCommand(
       SESSION,
-      `cd ${this.dirPath(s, target)} && PORT=${PREVIEW_PORT} HOST=0.0.0.0 HOSTNAME=0.0.0.0 BROWSER=none __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${allowed} nohup ${command} > /tmp/fb-preview.log 2>&1 &`,
+      `cd ${dir} && EXPO_NO_TELEMETRY=1 PORT=${PREVIEW_PORT} HOST=0.0.0.0 HOSTNAME=0.0.0.0 BROWSER=none __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${allowed} nohup ${command} > /tmp/fb-preview.log 2>&1 &`,
     );
     const started = Date.now();
     let up = false;
@@ -879,7 +1175,7 @@ export class FixRun extends DurableObject<AppEnv> {
     if (!up) throw new Error(`the app did not answer on port ${PREVIEW_PORT} within ${PREVIEW_BOOT_SEC}s`);
     this.emit({ type: "exit", command, exitCode: 0, ms: Date.now() - started });
     const expiresAt = new Date(Date.now() + PREVIEW_TTL_SEC * 1000).toISOString();
-    await this.setPreview(s, { state: "live", url: signed.url, command, port: PREVIEW_PORT, expiresAt });
+    await this.setPreview(s, { state: "live", url: signed.url, command, port: PREVIEW_PORT, expiresAt, framework, dir: rel || undefined });
     this.info(`Live preview is up for ${PREVIEW_TTL_SEC / 60} minutes. The sandbox is deleted when it expires.`);
     return "previewing";
   }
@@ -965,12 +1261,18 @@ export class FixRun extends DurableObject<AppEnv> {
       ...all.map((p) => `- \`${p.package}\`: ${p.reason}`),
       ``,
       `### Verified in an isolated Daytona sandbox`,
+      ...(s.agent === "claude-code" ? [`- Repaired by Claude Code inside the sandbox; the checks were then re-run independently`] : []),
       ...(npm ? [`- npm installs ran with lifecycle scripts disabled`] : []),
       ...(python ? [`- Python lockfiles were resolved and checked before anything was installed`] : []),
       `- Lockfiles clean: ${s.lockfileClean ? "yes, no affected versions of the bumped packages remain" : "not verified"}`,
       `- Checks:`,
       ...s.attempts.map((a) => `  - Attempt ${a.n}${a.lockfile ? ` (\`${a.lockfile}\`)` : ""}: \`${a.command}\` ${a.passed ? "✅ passed" : `❌ failed (exit ${a.exitCode ?? "timeout"})`}`),
-      ...(s.agentNotes.length ? [``, `### Agent repairs`, ...s.agentNotes.map((n) => `- ${n}`)] : []),
+      ...(s.agentNotes.length
+        ? [``, `### Agent repairs${s.agent === "claude-code" ? " (Claude Code)" : ""}`, ...s.agentNotes.map((n) => `- ${n}`)]
+        : []),
+      ...(s.history && (s.history.found || s.history.board)
+        ? [``, `Coordinated through OpenCrawl: ${s.history.found} passage(s) from earlier agent sessions, ${s.history.board} board note(s) from other runs.`]
+        : []),
       ``,
       `### Sources`,
       ...s.incidents.flatMap((i) => i.sources.slice(0, 3).map((src) => `- ${i.id}: [${src.title}](${src.url})`)),
@@ -982,6 +1284,39 @@ export class FixRun extends DurableObject<AppEnv> {
     ];
     return lines.join("\n");
   }
+}
+
+interface WorkspacePackage {
+  dir: string;
+  name: string;
+  scripts: Record<string, string>;
+  deps: string[];
+  tsconfig: boolean;
+}
+
+/** The command that serves a package's web app on PREVIEW_PORT, or null when it isn't a web app Firebreak can serve. */
+function webCommand(pkg: WorkspacePackage, manager: string): { command: string; framework: string; score: number } | null {
+  const port = String(PREVIEW_PORT);
+  if (pkg.deps.includes("expo")) {
+    // Native-only Expo apps have nothing to show in a browser.
+    if (!pkg.deps.includes("react-native-web")) return null;
+    return { command: `npx expo start --web --port ${port}`, framework: "Expo web", score: 1 };
+  }
+  const run = (name: string) => (manager === "npm" ? `npm run ${name} --` : `${manager} run ${name}`);
+  for (const name of ["dev", "start", "preview"]) {
+    const script = pkg.scripts[name];
+    if (!script || /^\s*(echo|exit)\b/.test(script)) continue;
+    if (/\bnext\b/.test(script)) return { command: `${run(name)} -H 0.0.0.0 -p ${port}`, framework: "Next.js", score: 3 };
+    const m = /\b(vite|astro|react-router|remix|nuxt|svelte-kit|vinext)\b/.exec(script);
+    if (m && !/\bvitest\b/.test(script)) {
+      const names: Record<string, string> = { vite: "Vite", astro: "Astro", "react-router": "React Router", remix: "Remix", nuxt: "Nuxt", "svelte-kit": "SvelteKit", vinext: "vinext" };
+      return { command: `${run(name)} --host 0.0.0.0 --port ${port}`, framework: names[m[1]!]!, score: 3 };
+    }
+    if (/\bng serve\b/.test(script)) return { command: `${run(name)} --host 0.0.0.0 --port ${port}`, framework: "Angular", score: 3 };
+    if (/react-scripts start/.test(script)) return { command: manager === "npm" ? `npm run ${name}` : `${manager} run ${name}`, framework: "Create React App", score: 2 };
+    if (/\bwrangler\b/.test(script)) return { command: `${run(name)} --ip 0.0.0.0 --port ${port}`, framework: "Wrangler", score: 2 };
+  }
+  return null;
 }
 
 /** Single-quotes a string for the shell. */

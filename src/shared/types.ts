@@ -167,7 +167,13 @@ export interface RunPreview {
   port?: number;
   expiresAt?: string;
   note?: string;
+  /** What serves the preview ("Next.js", "Vite", "Expo web", …) and from which folder. */
+  framework?: string;
+  dir?: string;
 }
+
+/** Who did the repair work in a run. */
+export type RepairAgent = "claude-code" | "clonvo";
 
 export interface RunResult {
   attempts: RunAttempt[];
@@ -178,6 +184,9 @@ export interface RunResult {
   durationMs: number;
   error?: string;
   preview?: RunPreview;
+  agent?: RepairAgent;
+  /** Coordination through OpenCrawl: passages found in agent history, and board messages from other runs/agents. */
+  history?: { found: number; board: number };
 }
 
 export interface Run {
@@ -201,12 +210,14 @@ export type RunEvent =
   | { t: number; type: "cmd"; command: string }
   | { t: number; type: "exit"; command: string; exitCode: number | null; ms: number }
   | { t: number; type: "agent"; text: string }
+  /** A tool an agent or integration used: "opencrawl.search", "claude.Bash", "expo.doctor", … */
+  | { t: number; type: "tool"; tool: string; text: string }
   | { t: number; type: "status"; status: RunStatus; step: RunStep }
   | { t: number; type: "preview"; preview: RunPreview };
 
 export interface WatchStatus {
   lastRun: { at: string; trigger: string; osvChecked: number; newsChecked: number; newIncidents: number; errors: string[] } | null;
-  integrations: { you: boolean; clonvo: boolean; daytona: boolean; github: boolean };
+  integrations: { you: boolean; clonvo: boolean; daytona: boolean; github: boolean; opencrawl: boolean; claudeCode: boolean };
   models: { fix: string; extract: string };
 }
 

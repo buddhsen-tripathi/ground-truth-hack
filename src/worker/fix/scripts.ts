@@ -164,3 +164,83 @@ else:
         open(req, "w").write("\n".join(lines))
 print(json.dumps(report))
 `;
+
+/**
+ * Reads Claude Code's stream-json on stdin and prints one short JSON line per thing worth showing: the init, each
+ * text block, each tool call, failed tool results and the final result. Tool results (file contents, command output)
+ * stay in the sandbox, so the Worker only polls a small log.
+ */
+export const CLAUDE_FILTER = String.raw`
+const rl = require("readline").createInterface({ input: process.stdin, crlfDelay: Infinity });
+const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+const short = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n);
+const describe = (input) => {
+  const i = input || {};
+  if (i.command) return i.command;
+  if (i.file_path) return i.file_path + (i.old_string ? " (edit)" : "");
+  if (i.pattern) return i.pattern + (i.path ? " in " + i.path : "");
+  if (i.query) return i.query;
+  if (i.url) return i.url;
+  if (i.topics) return [].concat(i.topics).join(", ") + (i.posts && i.posts.length ? " (+" + i.posts.length + " post)" : "");
+  if (i.todos) return i.todos.length + " todos";
+  if (i.description) return i.description;
+  return JSON.stringify(i);
+};
+rl.on("line", (line) => {
+  let e;
+  try {
+    e = JSON.parse(line);
+  } catch {
+    if (line.trim()) out({ k: "raw", text: short(line, 300) });
+    return;
+  }
+  if (e.type === "system" && e.subtype === "init")
+    out({ k: "init", model: e.model, tools: (e.tools || []).length, mcp: (e.mcp_servers || []).map((m) => m.name + ":" + m.status) });
+  else if (e.type === "assistant")
+    for (const c of (e.message && e.message.content) || []) {
+      if (c.type === "text" && c.text && c.text.trim()) out({ k: "text", text: short(c.text, 600) });
+      else if (c.type === "tool_use") out({ k: "tool", tool: c.name, text: short(describe(c.input), 240) });
+    }
+  else if (e.type === "user")
+    for (const c of (e.message && e.message.content) || []) {
+      if (c.type === "tool_result" && c.is_error) out({ k: "toolerr", text: short(typeof c.content === "string" ? c.content : JSON.stringify(c.content), 200) });
+    }
+  else if (e.type === "result")
+    out({ k: "result", ok: !e.is_error && e.subtype === "success", subtype: e.subtype, text: short(e.result, 800), turns: e.num_turns, cost: e.total_cost_usd, ms: e.duration_ms });
+});
+`;
+
+/** Lists the project's packages (up to three levels down) with their scripts and the web-framework dependencies they use. */
+export const SCAN_WORKSPACE = String.raw`
+const fs = require("fs");
+const path = require("path");
+const ROOT = process.argv[2];
+const WEB = /^(next|vite|astro|@remix-run\/dev|@react-router\/dev|nuxt|@sveltejs\/kit|expo|react-native-web|wrangler|vinext|react-scripts|@angular\/cli|gatsby|typescript)$/;
+const out = [];
+function walk(dir, depth) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  if (entries.some((e) => e.name === "package.json")) {
+    try {
+      const p = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+      const deps = Object.assign({}, p.dependencies, p.devDependencies);
+      out.push({
+        dir: path.relative(ROOT, dir),
+        name: p.name || "",
+        scripts: p.scripts || {},
+        deps: Object.keys(deps).filter((k) => WEB.test(k)),
+        tsconfig: entries.some((e) => e.name === "tsconfig.json"),
+      });
+    } catch {}
+  }
+  if (depth >= 3) return;
+  for (const e of entries)
+    if (e.isDirectory() && !e.name.startsWith(".") && !/^(node_modules|dist|build|out|ios|android|coverage)$/.test(e.name)) walk(path.join(dir, e.name), depth + 1);
+}
+walk(ROOT, 0);
+console.log(JSON.stringify(out.slice(0, 60)));
+`;
