@@ -77,6 +77,37 @@ describe("chooseTarget", () => {
   });
 });
 
+describe("Expo SDK range", () => {
+  const base = {
+    ecosystem: "npm" as const,
+    manager: "pnpm" as const,
+    lockfile: "pnpm-lock.yaml",
+    package: "expo-image",
+    versions: ["2.0.1"],
+    direct: true,
+    others: [],
+  };
+  it("stays inside the SDK's supported range", () => {
+    const fix = planPackage({
+      ...base,
+      incidents: [{ id: "GHSA-x", kind: "vulnerability", severity: "high", title: "x", affected: { versions: [], ranges: [{ introduced: "0", fixed: "2.0.3" }] } }],
+      pack: pack(["2.0.1", "2.0.3", "2.0.7", "3.0.0"]),
+      expo: { sdk: 52, range: "~2.0.7" },
+    });
+    expect(fix).toMatchObject({ to: "2.0.7" });
+    expect("reason" in fix && fix.reason).toMatch(/Expo SDK 52/);
+  });
+  it("asks for an SDK upgrade when the fix is outside the range", () => {
+    const fix = planPackage({
+      ...base,
+      incidents: [{ id: "GHSA-y", kind: "vulnerability", severity: "high", title: "y", affected: { versions: [], ranges: [{ introduced: "0", fixed: "3.0.0" }] } }],
+      pack: pack(["2.0.1", "2.0.7", "3.0.0"]),
+      expo: { sdk: 52, range: "~2.0.7" },
+    });
+    expect(fix).toMatchObject({ skip: expect.stringMatching(/Needs an Expo SDK upgrade.*3\.0\.0/) });
+  });
+});
+
 describe("PyPI", () => {
   it("orders PEP 440 versions", () => {
     const sorted = ["1.0.post1", "1.0", "1.0rc1", "1.0.dev0", "1.0a1", "0.9", "1.0.1", "2!0.1"].sort(compare);

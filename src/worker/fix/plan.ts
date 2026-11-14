@@ -5,6 +5,7 @@ import { getPackument, type Packument } from "../integrations/npm-registry";
 import { getPypiReleases } from "../integrations/pypi";
 import { lockfileDir, managerFor } from "../lockfiles";
 import { chooseTarget, schemeFor, type Affected } from "../versions";
+import semver from "semver";
 
 type PlanIncident = Pick<Incident, "id" | "kind" | "severity" | "title" | "affected">;
 
@@ -26,6 +27,8 @@ export function planPackage(args: {
   incidents: PlanIncident[];
   others: Affected[];
   pack: Packument;
+  /** Expo pins native modules to what its SDK was built against: the target has to stay inside this range. */
+  expo?: { sdk: number; range: string };
 }): PackageFix | { skip: string } {
   const S = schemeFor(args.ecosystem);
   const from = [...args.versions].sort((a, b) => (S.valid(a) && S.valid(b) ? S.cmp(a, b) : 0)).at(-1)!;
@@ -34,8 +37,18 @@ export function planPackage(args: {
     kind: malicious ? ("malicious" as const) : ("vulnerability" as const),
     affected: { versions: args.incidents.flatMap((i) => i.affected.versions), ranges: args.incidents.flatMap((i) => i.affected.ranges) },
   };
-  const target = chooseTarget(merged, from, args.pack, args.others, args.ecosystem);
+  const pack = args.expo ? { ...args.pack, versions: args.pack.versions.filter((v) => semver.satisfies(v, args.expo!.range)) } : args.pack;
+  let target = chooseTarget(merged, from, pack, args.others, args.ecosystem);
+  if (!target && args.expo) {
+    const outside = chooseTarget(merged, from, args.pack, args.others, args.ecosystem);
+    return {
+      skip: outside
+        ? `Needs an Expo SDK upgrade: SDK ${args.expo.sdk} supports ${args.package} ${args.expo.range}, and the first clean release is ${outside.to}. Upgrade with \`npx expo install expo@latest --fix\`.`
+        : `No release of ${args.package} clears every known advisory.`,
+    };
+  }
   if (!target) return { skip: `No release of ${args.package} clears every known advisory.` };
+  if (args.expo) target = { ...target, reason: `${target.reason} Stays within Expo SDK ${args.expo.sdk}'s supported range (${args.expo.range}).` };
   // Pinned requirements files list every package, so each pin is edited in place.
   const direct = args.direct || args.manager === "pip";
   const strategy = direct ? target.strategyHint : "override";
@@ -54,6 +67,35 @@ export function planPackage(args: {
       (direct ? target.reason : `${args.package} is a transitive dependency, so it's forced with ${how}. ${target.reason}`) +
       (cleared > 1 ? ` It clears all ${cleared} known advisories for ${args.package}.` : ""),
   };
+}
+
+/** Native module versions an Expo SDK was built against (what `npx expo install` picks), keyed by package. */
+async function expoModules(version: string): Promise<Record<string, string>> {
+  const res = await fetch(`https://cdn.jsdelivr.net/npm/expo@${encodeURIComponent(version)}/bundledNativeModules.json`, { cf: { cacheTtl: 86_400 } });
+  if (!res.ok) throw new Error(`bundledNativeModules.json for expo@${version}: ${res.status}`);
+  return (await res.json()) as Record<string, string>;
+}
+
+/** Lockfile → the Expo SDK it uses and that SDK's module ranges, for lockfiles that include expo. */
+async function expoByLockfile(env: AppEnv, repoId: string): Promise<Map<string, { sdk: number; modules: Record<string, string> }>> {
+  const rows = await env.DB.prepare(`SELECT lockfile, version FROM deps WHERE repo_id = ? AND ecosystem = 'npm' AND name = 'expo'`).bind(repoId).all<{ lockfile: string; version: string }>();
+  const newest = new Map<string, string>();
+  for (const r of rows.results) {
+    if (!semver.valid(r.version)) continue;
+    const cur = newest.get(r.lockfile);
+    if (!cur || semver.gt(r.version, cur)) newest.set(r.lockfile, r.version);
+  }
+  const out = new Map<string, { sdk: number; modules: Record<string, string> }>();
+  await Promise.all(
+    [...newest].map(async ([lockfile, version]) => {
+      try {
+        out.set(lockfile, { sdk: semver.major(version), modules: await expoModules(version) });
+      } catch {
+        // Without the SDK's module list the plan falls back to the normal rules.
+      }
+    }),
+  );
+  return out;
 }
 
 const registry = (ecosystem: FixEcosystem, name: string) => (ecosystem === "PyPI" ? getPypiReleases(name) : getPackument(name));
@@ -77,6 +119,7 @@ export async function planRepoFix(env: AppEnv, repoId: string): Promise<FixPlan>
     groups.set(key, g);
   }
 
+  const expo = await expoByLockfile(env, repoId);
   const targets = new Map<string, LockfileFix>();
   const skipped: SkippedFix[] = [];
   await Promise.all(
@@ -95,9 +138,22 @@ export async function planRepoFix(env: AppEnv, repoId: string): Promise<FixPlan>
           env.DB.prepare(`${INCIDENT_SELECT} WHERE i.ecosystem = ? AND i.package = ?`).bind(g.ecosystem, g.package).all(),
         ]);
         const rest = others.results.map(rowToIncident).filter((i) => !g.incidents.has(i.id)).map((i) => i.affected);
-        const fix = planPackage({ ecosystem, manager, lockfile: g.lockfile, package: g.package, versions: [...g.versions], direct: g.direct, incidents, others: rest, pack });
+        const sdk = ecosystem === "npm" ? expo.get(g.lockfile) : undefined;
+        const range = sdk?.modules[g.package];
+        const fix = planPackage({
+          ecosystem,
+          manager,
+          lockfile: g.lockfile,
+          package: g.package,
+          versions: [...g.versions],
+          direct: g.direct,
+          incidents,
+          others: rest,
+          pack,
+          expo: sdk && range && semver.validRange(range) ? { sdk: sdk.sdk, range } : undefined,
+        });
         if ("skip" in fix) return skip(fix.skip);
-        const t = targets.get(g.lockfile) ?? { lockfile: g.lockfile, dir: lockfileDir(g.lockfile, manager), manager, ecosystem, packages: [] };
+        const t = targets.get(g.lockfile) ?? { lockfile: g.lockfile, dir: lockfileDir(g.lockfile, manager), manager, ecosystem, expoSdk: sdk?.sdk, packages: [] };
         t.packages.push(fix);
         targets.set(g.lockfile, t);
       } catch (e) {

@@ -126,6 +126,8 @@ export interface LockfileFix {
   dir: string;
   manager: Manager;
   ecosystem: FixEcosystem;
+  /** Expo SDK major when the project is an Expo app: Expo-managed packages stay in that SDK's supported range. */
+  expoSdk?: number;
   packages: PackageFix[];
 }
 
