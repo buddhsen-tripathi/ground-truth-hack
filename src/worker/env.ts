@@ -7,8 +7,8 @@ export type AppEnv = Env & {
   /** OpenCrawl agent access token (`opencrawl token create`): agent history search and the board. */
   OPENCRAWL_TOKEN?: string;
   OPENCRAWL_API_URL?: string;
-  /** Claude Code token (`claude setup-token`): runs Claude Code as the repair agent inside the sandbox. */
-  CLAUDE_CODE_OAUTH_TOKEN?: string;
+  /** ~/.codex/auth.json from a ChatGPT login: runs Codex as the repair agent inside the sandbox (Clonvo is the fallback). */
+  CODEX_AUTH_JSON?: string;
   CLONVO_BASE_URL: string;
   DAYTONA_API_URL: string;
   FIX_MODEL: string;

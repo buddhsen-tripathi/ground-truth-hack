@@ -166,47 +166,41 @@ print(json.dumps(report))
 `;
 
 /**
- * Reads Claude Code's stream-json on stdin and prints one short JSON line per thing worth showing: the init, each
- * text block, each tool call, failed tool results and the final result. Tool results (file contents, command output)
- * stay in the sandbox, so the Worker only polls a small log.
+ * Reads `codex exec --json` events on stdin and prints one short JSON line per thing worth showing: each agent
+ * message, command, file change, MCP or web call, errors and the final result. Command output and file contents stay
+ * in the sandbox, so the Worker only polls a small log.
  */
-export const CLAUDE_FILTER = String.raw`
+export const CODEX_FILTER = String.raw`
 const rl = require("readline").createInterface({ input: process.stdin, crlfDelay: Infinity });
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
 const short = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n);
 const describe = (input) => {
-  const i = input || {};
-  if (i.command) return i.command;
-  if (i.file_path) return i.file_path + (i.old_string ? " (edit)" : "");
-  if (i.pattern) return i.pattern + (i.path ? " in " + i.path : "");
+  let i = input || {};
+  if (typeof i === "string") { try { i = JSON.parse(i); } catch { return i; } }
   if (i.query) return i.query;
   if (i.url) return i.url;
   if (i.topics) return [].concat(i.topics).join(", ") + (i.posts && i.posts.length ? " (+" + i.posts.length + " post)" : "");
-  if (i.todos) return i.todos.length + " todos";
-  if (i.description) return i.description;
   return JSON.stringify(i);
 };
+// "/bin/bash -lc 'npm test'" → "npm test"
+const unwrap = (c) => { const m = /^\S*\/(?:ba|z)?sh -lc (.*)$/s.exec(String(c || "")); let x = m ? m[1] : String(c || ""); if (/^'.*'$/s.test(x)) x = x.slice(1, -1).replace(/'\\''/g, "'"); return x; };
+let last = "", commands = 0, edits = 0;
 rl.on("line", (line) => {
   let e;
-  try {
-    e = JSON.parse(line);
-  } catch {
-    if (line.trim()) out({ k: "raw", text: short(line, 300) });
-    return;
+  try { e = JSON.parse(line); } catch { if (line.trim()) out({ k: "raw", text: short(line, 300) }); return; }
+  const it = e.item || {};
+  if (e.type === "thread.started") out({ k: "init" });
+  else if (e.type === "item.completed" && it.type === "agent_message") { last = it.text || ""; if (last.trim()) out({ k: "text", text: short(last, 600) }); }
+  else if (e.type === "item.started" && it.type === "command_execution") { commands++; out({ k: "tool", tool: "Bash", text: short(unwrap(it.command), 240) }); }
+  else if (e.type === "item.completed" && it.type === "file_change" && it.status !== "failed") {
+    for (const c of it.changes || []) { edits++; out({ k: "tool", tool: "Edit", text: short(c.path + " (" + (c.kind || "update") + ")", 240) }); }
   }
-  if (e.type === "system" && e.subtype === "init")
-    out({ k: "init", model: e.model, tools: (e.tools || []).length, mcp: (e.mcp_servers || []).map((m) => m.name + ":" + m.status) });
-  else if (e.type === "assistant")
-    for (const c of (e.message && e.message.content) || []) {
-      if (c.type === "text" && c.text && c.text.trim()) out({ k: "text", text: short(c.text, 600) });
-      else if (c.type === "tool_use") out({ k: "tool", tool: c.name, text: short(describe(c.input), 240) });
-    }
-  else if (e.type === "user")
-    for (const c of (e.message && e.message.content) || []) {
-      if (c.type === "tool_result" && c.is_error) out({ k: "toolerr", text: short(typeof c.content === "string" ? c.content : JSON.stringify(c.content), 200) });
-    }
-  else if (e.type === "result")
-    out({ k: "result", ok: !e.is_error && e.subtype === "success", subtype: e.subtype, text: short(e.result, 800), turns: e.num_turns, cost: e.total_cost_usd, ms: e.duration_ms });
+  else if (e.type === "item.started" && it.type === "mcp_tool_call") out({ k: "tool", tool: "mcp__" + it.server + "__" + it.tool, text: short(describe(it.arguments), 240) });
+  else if (e.type === "item.completed" && it.type === "mcp_tool_call" && it.status === "failed") out({ k: "toolerr", text: short((it.error && it.error.message) || it.tool, 200) });
+  else if (e.type === "item.started" && it.type === "web_search") out({ k: "tool", tool: "WebSearch", text: short(it.query, 240) });
+  else if (e.type === "error") out({ k: "error", text: short(e.message, 400) });
+  else if (e.type === "turn.completed") out({ k: "result", ok: true, text: short(last, 800), commands, edits, tokens: e.usage ? (e.usage.input_tokens || 0) + (e.usage.output_tokens || 0) : 0 });
+  else if (e.type === "turn.failed") out({ k: "result", ok: false, subtype: "error", text: short((e.error && e.error.message) || last, 800), commands, edits });
 });
 `;
 

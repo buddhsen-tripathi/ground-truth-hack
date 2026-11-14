@@ -10,7 +10,7 @@ import { boardSync, opencrawlApi, opencrawlEnabled, packageTopic, repoTopic, sea
 import { parseLockfile } from "../lockfiles";
 import { parseDocument } from "yaml";
 import { isAffected } from "../versions";
-import { APPLY_EDITS, CLAUDE_FILTER, PATCH_PACKAGE_JSON, PATCH_PYTHON, SCAN_WORKSPACE } from "./scripts";
+import { APPLY_EDITS, CODEX_FILTER, PATCH_PACKAGE_JSON, PATCH_PYTHON, SCAN_WORKSPACE } from "./scripts";
 
 const SESSION = "firebreak";
 const MAX_REPAIRS = 3;
@@ -21,9 +21,8 @@ const PREVIEW_PORT = 3000;
 /** How long the sandbox stays up for the live preview after a verified fix. */
 const PREVIEW_TTL_SEC = 30 * 60;
 const PREVIEW_BOOT_SEC = 150;
-/** Claude Code gets one bounded session per repair round; the checks are re-run independently afterwards. */
+/** Codex gets one bounded session per repair round; the checks are re-run independently afterwards. */
 const AGENT_TIMEOUT_SEC = 12 * 60;
-const AGENT_MAX_TURNS = 40;
 
 type Phase = "sandbox" | "clone" | "patch" | "install" | "verify" | "test" | "repair" | "preview" | "previewing" | "ready" | "done";
 
@@ -406,7 +405,7 @@ export class FixRun extends DurableObject<AppEnv> {
         s.sandboxId = sb.id;
         await this.save();
         this.info(
-          `Sandbox ${sb.id} created. No secrets are passed in${this.env.CLAUDE_CODE_OAUTH_TOKEN ? " unless checks fail: then Claude Code gets its own token, after every lockfile is verified clean" : ""}.`,
+          `Sandbox ${sb.id} created. No secrets are passed in${this.env.CODEX_AUTH_JSON ? " unless checks fail: then Codex gets its own sign-in, after every lockfile is verified clean" : ""}.`,
         );
         await sb.waitStarted();
         s.home = (await sb.exec("echo $HOME")).output.trim() || "/home/daytona";
@@ -498,8 +497,8 @@ export class FixRun extends DurableObject<AppEnv> {
         if (/^Killed$|exit code 137|JavaScript heap out of memory|MemoryError/m.test(r.output.slice(-4000)))
           throw new Error("Checks were killed for running out of memory in the sandbox. Use a larger DAYTONA_SNAPSHOT. No PR will be offered.");
         if (s.repairs >= MAX_REPAIRS) throw new Error(`Checks still failing after ${MAX_REPAIRS} repair attempts. No PR will be offered.`);
-        if (!this.env.CLAUDE_CODE_OAUTH_TOKEN && !this.env.CLONVO_API_KEY)
-          throw new Error("Checks failed and neither CLAUDE_CODE_OAUTH_TOKEN nor CLONVO_API_KEY is set, so no agent can attempt a repair.");
+        if (!this.env.CODEX_AUTH_JSON && !this.env.CLONVO_API_KEY)
+          throw new Error("Checks failed and neither CODEX_AUTH_JSON nor CLONVO_API_KEY is set, so no agent can attempt a repair.");
         return "repair";
       }
 
@@ -826,7 +825,22 @@ export class FixRun extends DurableObject<AppEnv> {
     const history = await this.historyNotes(s, suspect, failure);
     const language = python ? "Python" : "JavaScript/TypeScript";
     const manifests = python ? "lockfiles, pyproject.toml, requirements files, virtualenvs" : "lockfiles, package.json, node_modules";
-    if (this.env.CLAUDE_CODE_OAUTH_TOKEN) return this.claudeRepair(sb, s, t, { failure, notes, history, suspect: suspect.package, language, manifests });
+    if (this.env.CODEX_AUTH_JSON) {
+      let edits = 0;
+      let why = "";
+      try {
+        edits = await this.codexRepair(sb, s, t, { failure, notes, history, suspect: suspect.package, language, manifests });
+        if (!edits) why = "Codex made no source change for this failure";
+      } catch (e) {
+        why = (e as Error).message;
+      }
+      // The agent had a shell: the lockfiles must still be exactly as verified before anything else runs.
+      for (const target of s.plan.targets) await this.checkLockfile(sb, s, target);
+      if (edits) return;
+      if (!this.env.CLONVO_API_KEY) throw new Error(`${why}. No PR will be offered.`);
+      this.emit({ type: "log", stream: "err", text: `Codex: ${why}.` });
+      this.emit({ type: "tool", tool: "clonvo.fallback", text: "Falling back to Clonvo for this repair" });
+    }
     s.agent = "clonvo";
     const grep = await sb.exec(grepCmd);
     const files = [...new Set([...grep.output.split("\n").map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean), ...new Set(fromError.slice(0, 6))])].slice(0, 10);
@@ -954,50 +968,60 @@ export class FixRun extends DurableObject<AppEnv> {
     return [hits.join("\n").slice(0, 6000), board].filter(Boolean).join("\n\n");
   }
 
-  // ── Claude Code as the repair agent ───────────────────────────────────────────────────────────────
+  // ── Codex as the repair agent ─────────────────────────────────────────────────────────────────────
 
-  private async ensureClaude(sb: Sandbox): Promise<void> {
-    const r = await this.run(
-      sb,
-      `(command -v claude || npm i -g --prefix ~/.local @anthropic-ai/claude-code || (curl -fsSL https://claude.ai/install.sh | bash)) >/dev/null 2>&1; claude --version`,
-      240,
-      "claude --version",
-    );
-    if (r.exitCode !== 0) throw new Error("Could not install Claude Code in the sandbox");
+  private async ensureCodex(sb: Sandbox): Promise<void> {
+    const r = await this.run(sb, `(command -v codex || npm i -g --prefix ~/.local @openai/codex) >/dev/null 2>&1; codex --version`, 240, "codex --version");
+    if (r.exitCode !== 0) throw new Error("Could not install Codex in the sandbox");
   }
 
   /**
-   * Runs Claude Code headless in the project with the failure, migration notes and OpenCrawl history. It can read,
-   * edit and re-run the checks itself, and reach OpenCrawl over MCP to search history and post to the board.
-   * The tokens are written to a file the command sources and deletes, and never appear in the run log.
+   * Runs Codex headless in the project with the failure, migration notes and OpenCrawl history. It can read, edit and
+   * re-run the checks itself, and reach OpenCrawl over MCP. The ChatGPT sign-in goes into a private CODEX_HOME that is
+   * deleted afterwards, and no token appears in the run log. Returns how many files it changed; throws when it couldn't run.
    */
-  private async claudeRepair(
+  private async codexRepair(
     sb: Sandbox,
     s: State,
     t: LockfileFix,
     ctx: { failure: string; notes: string; history: string; suspect: string; language: string; manifests: string },
-  ): Promise<void> {
-    s.agent = "claude-code";
-    await this.ensureClaude(sb);
+  ): Promise<number> {
+    const raw = this.env.CODEX_AUTH_JSON!;
+    let auth: Record<string, unknown>;
+    try {
+      auth = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new Error("CODEX_AUTH_JSON is not valid JSON. Put the whole of ~/.codex/auth.json in the secret");
+    }
+    // Every token in the sign-in, so none of them can reach the run log.
+    const tokens = auth.tokens && typeof auth.tokens === "object" ? Object.values(auth.tokens as Record<string, unknown>) : [];
     const oc = this.env.OPENCRAWL_TOKEN;
-    const secrets = [this.env.CLAUDE_CODE_OAUTH_TOKEN!, ...(oc ? [oc] : [])];
+    const secrets = [...tokens, auth.OPENAI_API_KEY, oc].filter((x): x is string => typeof x === "string" && x.length > 8);
+    const redact = (x: string) => secrets.reduce((acc, sec) => acc.split(sec).join("***"), x);
+
+    await this.ensureCodex(sb);
+    const home = "/tmp/fb-codex";
+    await sb.exec(`rm -rf ${home} && mkdir -p ${home} && chmod 700 ${home}`);
+    // A fresh last_refresh keeps Codex from refreshing the login up front, which would rotate the token you use locally.
+    await sb.writeFile(`${home}/auth.json`, JSON.stringify({ ...auth, last_refresh: new Date().toISOString() }));
     await sb.writeFile(
-      "/tmp/fb-agent.env",
-      [`export CLAUDE_CODE_OAUTH_TOKEN=${shq(secrets[0]!)}`, ...(oc ? [`export OPENCRAWL_TOKEN=${shq(oc)}`] : [])].join("\n") + "\n",
+      `${home}/config.toml`,
+      [
+        `cli_auth_credentials_store = "file"`,
+        `check_for_update_on_startup = false`,
+        ...(oc ? [``, `[mcp_servers.opencrawl]`, `url = "${opencrawlApi(this.env)}/mcp"`, `bearer_token_env_var = "OPENCRAWL_TOKEN"`] : []),
+      ].join("\n") + "\n",
     );
-    if (oc)
-      await sb.writeFile(
-        "/tmp/fb-mcp.json",
-        JSON.stringify({ mcpServers: { opencrawl: { type: "http", url: `${opencrawlApi(this.env)}/mcp`, headers: { Authorization: "Bearer ${OPENCRAWL_TOKEN}" } } } }),
-      );
-    await sb.writeFile("/tmp/fb-claude-filter.cjs", CLAUDE_FILTER);
+    if (oc) await sb.writeFile("/tmp/fb-agent.env", `export OPENCRAWL_TOKEN=${shq(oc)}\n`);
+    await sb.writeFile("/tmp/fb-codex-filter.cjs", CODEX_FILTER);
+    const dir = this.dirPath(s, t);
     const command = s.tests[t.lockfile]!;
     const changes = t.packages.map((p) => `- ${p.package} ${p.from.join("/")} → ${p.to} (${p.strategy})`).join("\n");
     const topic = packageTopic(t.ecosystem, ctx.suspect);
     const prompt = [
       `Firebreak bumped dependencies in ${s.fullName} to clear security advisories, and the project's checks now fail. Make them pass.`,
       ``,
-      `Project directory: ${this.dirPath(s, t)} (lockfile ${t.lockfile}, ${t.manager}${t.expoSdk ? `, Expo SDK ${t.expoSdk} app` : ""}).`,
+      `Project directory: ${dir} (lockfile ${t.lockfile}, ${t.manager}${t.expoSdk ? `, Expo SDK ${t.expoSdk} app` : ""}).`,
       `Dependency changes:\n${changes}`,
       `Failing check, run from the project directory: ${command}`,
       ``,
@@ -1011,6 +1035,7 @@ export class FixRun extends DurableObject<AppEnv> {
       `- Don't edit ${ctx.manifests}. Don't install, add, remove or upgrade packages: dependencies are already installed with lifecycle scripts disabled.`,
       `- Don't delete, skip or loosen tests to hide a failure.`,
       `- Don't commit, push or touch git config. Leave the changes in the working tree.`,
+      `- Don't read or print anything under ${home} or environment variables holding tokens.`,
       `- Re-run the failing check to confirm before you stop. If the failure has nothing to do with the bump, say so and change nothing.`,
       ...(oc
         ? [
@@ -1023,21 +1048,21 @@ export class FixRun extends DurableObject<AppEnv> {
     ].join("\n");
     await sb.writeFile("/tmp/fb-prompt.md", prompt);
 
-    const flags = `--output-format stream-json --verbose --dangerously-skip-permissions --max-turns ${AGENT_MAX_TURNS}${oc ? " --mcp-config /tmp/fb-mcp.json" : ""}`;
-    const display = `claude -p <repair brief> ${flags.replace(" --mcp-config /tmp/fb-mcp.json", " --mcp-config opencrawl")}`;
+    const flags = `--json --ephemeral --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C ${shq(dir)}`;
+    const display = `codex exec <repair brief> --json --dangerously-bypass-approvals-and-sandbox${oc ? " (MCP: opencrawl)" : ""}`;
     this.emit({ type: "cmd", command: display });
-    this.emit({ type: "tool", tool: "claude.start", text: `Claude Code is repairing ${t.dir || "the repo root"} (up to ${AGENT_MAX_TURNS} turns, ${AGENT_TIMEOUT_SEC / 60} min)` });
+    this.emit({ type: "tool", tool: "codex.start", text: `Codex is repairing ${t.dir || "the repo root"} (up to ${AGENT_TIMEOUT_SEC / 60} min)` });
     const started = Date.now();
     const cmdId = await sb.startCommand(
       SESSION,
-      `cd ${this.dirPath(s, t)} && . /tmp/fb-agent.env && rm -f /tmp/fb-agent.env && IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 claude -p "$(cat /tmp/fb-prompt.md)" ${flags} 2>/tmp/fb-claude.err | node /tmp/fb-claude-filter.cjs`,
+      `cd ${dir} && ${oc ? ". /tmp/fb-agent.env && rm -f /tmp/fb-agent.env && " : ""}CODEX_HOME=${home} codex exec ${flags} - < /tmp/fb-prompt.md 2>/tmp/fb-codex.err | node /tmp/fb-codex-filter.cjs`,
     );
-    const redact = (x: string) => secrets.reduce((acc, sec) => (sec ? acc.split(sec).join("***") : acc), x);
     let consumed = 0;
-    type AgentResult = { ok: boolean; subtype?: string; text: string; turns?: number; cost?: number };
+    type AgentResult = { ok: boolean; subtype?: string; text: string; commands?: number; tokens?: number };
     let result: AgentResult | null = null;
     let exitCode: number | null = null;
     let edits = 0;
+    const errors: string[] = [];
     const handle = (line: string) => {
       let e: { k: string; [k: string]: unknown };
       try {
@@ -1046,19 +1071,20 @@ export class FixRun extends DurableObject<AppEnv> {
         return;
       }
       const text = redact(String(e.text ?? ""));
-      if (e.k === "init") {
-        const mcp = (e.mcp as string[] | undefined) ?? [];
-        this.emit({ type: "tool", tool: "claude.init", text: `${String(e.model ?? "Claude")} · ${e.tools} tools${mcp.length ? ` · MCP ${mcp.join(", ")}` : ""}` });
-      } else if (e.k === "text") this.emit({ type: "agent", text });
+      if (e.k === "init") this.emit({ type: "tool", tool: "codex.init", text: `Codex session started${oc ? " · MCP opencrawl" : ""}` });
+      else if (e.k === "text") this.emit({ type: "agent", text });
       else if (e.k === "tool") {
         const name = String(e.tool ?? "");
         const tool = name.startsWith("mcp__opencrawl__")
           ? `opencrawl.${name.slice("mcp__opencrawl__".length).replace(/^board_.*/, "board")}`
-          : `claude.${name}`;
-        if (/^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) edits++;
+          : `codex.${name}`;
+        if (name === "Edit") edits++;
         this.emit({ type: "tool", tool, text });
-      } else if (e.k === "toolerr") this.emit({ type: "log", stream: "err", text: `tool error: ${text}` });
-      else if (e.k === "result") result = { ok: !!e.ok, subtype: e.subtype as string | undefined, text, turns: e.turns as number, cost: e.cost as number };
+      } else if (e.k === "toolerr" || e.k === "error") {
+        errors.push(text);
+        this.emit({ type: "log", stream: "err", text: `codex: ${text}` });
+      } else if (e.k === "result")
+        result = { ok: !!e.ok, subtype: e.subtype as string | undefined, text, commands: e.commands as number, tokens: e.tokens as number };
     };
     while (Date.now() - started < AGENT_TIMEOUT_SEC * 1000) {
       await sleep(2500);
@@ -1074,27 +1100,25 @@ export class FixRun extends DurableObject<AppEnv> {
       if (exitCode !== null) break;
     }
     if (exitCode === null) {
-      await sb.exec("pkill -f 'claude -p' || true").catch(() => undefined);
-      this.emit({ type: "log", stream: "err", text: `Claude Code stopped after ${AGENT_TIMEOUT_SEC / 60} minutes.` });
+      await sb.exec("pkill -f 'codex exec' || true").catch(() => undefined);
+      this.emit({ type: "log", stream: "err", text: `Codex stopped after ${AGENT_TIMEOUT_SEC / 60} minutes.` });
     }
-    await sb.exec("rm -f /tmp/fb-agent.env /tmp/fb-mcp.json").catch(() => undefined);
+    const stderr = redact((await sb.exec("tail -c 1500 /tmp/fb-codex.err").catch(() => ({ output: "" }))).output.trim());
+    await sb.exec(`rm -rf ${home} /tmp/fb-agent.env /tmp/fb-codex.err`).catch(() => undefined);
     const r = result as AgentResult | null;
     this.emit({ type: "exit", command: display, exitCode: r?.ok ? 0 : (exitCode ?? null), ms: Date.now() - started });
+    const signIn = /401|unauthori[sz]ed|refresh.?token|log ?in again|token.*(expired|revoked|invalid)/i;
+    if (!edits && (signIn.test(stderr) || errors.some((x) => signIn.test(x)) || (r && !r.ok && signIn.test(r.text))))
+      throw new Error("Codex couldn't use the ChatGPT sign-in in CODEX_AUTH_JSON. Run `codex login` locally, then put ~/.codex/auth.json in the secret again");
     if (!r) {
-      const err = redact((await sb.exec("tail -c 1500 /tmp/fb-claude.err").catch(() => ({ output: "" }))).output.trim());
-      if (/401|invalid.*(api key|token)|authentication|OAuth/i.test(err))
-        throw new Error("Claude Code couldn't sign in with CLAUDE_CODE_OAUTH_TOKEN. Run `claude setup-token` and update the secret.");
-      if (exitCode !== null) throw new Error(`Claude Code exited without a result${err ? `: ${err.slice(-400)}` : ""}`);
+      if (!edits) throw new Error(`Codex ${exitCode === null ? "timed out" : "exited"} without a result${stderr ? `: ${stderr.slice(-300)}` : ""}`);
     } else {
-      const facts = [r.turns ? `${r.turns} turns` : "", edits ? `${edits} edit${edits === 1 ? "" : "s"}` : "", r.cost ? `$${r.cost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
-      this.emit({ type: "tool", tool: "claude.result", text: `${r.ok ? "Finished" : `Stopped (${r.subtype ?? "error"})`}${facts ? ` · ${facts}` : ""}` });
-      if (/401|invalid.*(api key|token)|OAuth token/i.test(r.text) && !edits)
-        throw new Error("Claude Code couldn't sign in with CLAUDE_CODE_OAUTH_TOKEN. Run `claude setup-token` and update the secret.");
+      const facts = [r.commands ? `${r.commands} commands` : "", edits ? `${edits} edit${edits === 1 ? "" : "s"}` : "", r.tokens ? `${Math.round(r.tokens / 1000)}k tokens` : ""].filter(Boolean).join(" · ");
+      this.emit({ type: "tool", tool: "codex.result", text: `${r.ok ? "Finished" : `Stopped (${r.subtype ?? "error"})`}${facts ? ` · ${facts}` : ""}` });
       if (r.text) s.agentNotes.push(r.text.slice(0, 500));
     }
-    // The agent had a shell: re-check that it left the lockfiles as verified before the checks run again.
-    for (const target of s.plan.targets) await this.checkLockfile(sb, s, target);
-    if (!edits) throw new Error("Claude Code made no source change for this failure. No PR will be offered.");
+    if (edits) s.agent = "codex";
+    return edits;
   }
 
   private async finishReady(sb: Sandbox, s: State): Promise<Phase> {
@@ -1261,14 +1285,14 @@ export class FixRun extends DurableObject<AppEnv> {
       ...all.map((p) => `- \`${p.package}\`: ${p.reason}`),
       ``,
       `### Verified in an isolated Daytona sandbox`,
-      ...(s.agent === "claude-code" ? [`- Repaired by Claude Code inside the sandbox; the checks were then re-run independently`] : []),
+      ...(s.agent === "codex" ? [`- Repaired by Codex inside the sandbox; the checks were then re-run independently`] : []),
       ...(npm ? [`- npm installs ran with lifecycle scripts disabled`] : []),
       ...(python ? [`- Python lockfiles were resolved and checked before anything was installed`] : []),
       `- Lockfiles clean: ${s.lockfileClean ? "yes, no affected versions of the bumped packages remain" : "not verified"}`,
       `- Checks:`,
       ...s.attempts.map((a) => `  - Attempt ${a.n}${a.lockfile ? ` (\`${a.lockfile}\`)` : ""}: \`${a.command}\` ${a.passed ? "✅ passed" : `❌ failed (exit ${a.exitCode ?? "timeout"})`}`),
       ...(s.agentNotes.length
-        ? [``, `### Agent repairs${s.agent === "claude-code" ? " (Claude Code)" : ""}`, ...s.agentNotes.map((n) => `- ${n}`)]
+        ? [``, `### Agent repairs${s.agent === "codex" ? " (Codex)" : ""}`, ...s.agentNotes.map((n) => `- ${n}`)]
         : []),
       ...(s.history && (s.history.found || s.history.board)
         ? [``, `Coordinated through OpenCrawl: ${s.history.found} passage(s) from earlier agent sessions, ${s.history.board} board note(s) from other runs.`]

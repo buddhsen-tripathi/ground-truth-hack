@@ -320,7 +320,7 @@ function RunPage() {
             <ul className="space-y-3 px-5 py-4 text-sm">
               <ReceiptLine
                 ok={true}
-                label={result?.agent === "claude-code" ? "Ran in an isolated sandbox; only the agent's own token went in, after the lockfiles checked clean" : "Ran in an isolated sandbox, no secrets passed in"}
+                label={result?.agent === "codex" ? "Ran in an isolated sandbox; only the agent's own sign-in went in, after the lockfiles checked clean" : "Ran in an isolated sandbox, no secrets passed in"}
               />
               <ReceiptLine
                 ok={run.step !== "plan" && run.step !== "sandbox" && run.step !== "clone" && run.step !== "patch" ? true : null}
@@ -336,21 +336,21 @@ function RunPage() {
                 />
               ))}
               {!result?.attempts.length ? <ReceiptLine ok={null} label="Project checks" /> : null}
-              {result?.agent ? <ReceiptLine ok={verified ? true : null} label={`Repairs by ${result.agent === "claude-code" ? "Claude Code" : "Clonvo"}, checks re-run independently`} /> : null}
+              {result?.agent ? <ReceiptLine ok={verified ? true : null} label={`Repairs by ${result.agent === "codex" ? "Codex" : "Clonvo"}, checks re-run independently`} /> : null}
               {result?.history && (result.history.found || result.history.board) ? (
                 <ReceiptLine ok={true} label={`OpenCrawl: ${result.history.found} passages from agent history, ${result.history.board} board notes from other runs`} />
               ) : null}
             </ul>
           </Card>
 
-          {activity.length ? <AgentActivity items={activity} agent={result?.agent ?? (activity.some((e) => e.type === "tool" && e.tool.startsWith("claude.")) ? "claude-code" : "clonvo")} /> : null}
+          {activity.length ? <AgentActivity items={activity} agent={result?.agent ?? (activity.some((e) => e.type === "tool" && e.tool.startsWith("codex.")) ? "codex" : "clonvo")} /> : null}
         </div>
       </div>
     </div>
   );
 }
 
-function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "agent" | "tool" }>[]; agent: "claude-code" | "clonvo" }) {
+function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "agent" | "tool" }>[]; agent: "codex" | "clonvo" }) {
   const [all, setAll] = useState(false);
   const shown = all ? items : items.slice(-14);
   const used = [...new Set(items.filter((e) => e.type === "tool").map((e) => toolLogo((e as { tool: string }).tool)))];
@@ -362,7 +362,7 @@ function AgentActivity({ items, agent }: { items: Extract<RunEvent, { type: "age
             <Robot weight="bold" className="size-4" /> Agents and tools
           </span>
         }
-        description={agent === "claude-code" ? "Claude Code in the sandbox, coordinating through OpenCrawl" : "Repairs proposed through Clonvo"}
+        description={agent === "codex" ? "Codex in the sandbox, with Clonvo as the fallback, coordinating through OpenCrawl" : "Repairs proposed through Clonvo"}
       />
       {used.length ? (
         <div className="flex flex-wrap gap-1.5 border-b border-border px-5 py-2.5">

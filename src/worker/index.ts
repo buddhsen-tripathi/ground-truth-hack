@@ -37,7 +37,7 @@ async function watchStatus(env: AppEnv): Promise<WatchStatus> {
       daytona: !!env.DAYTONA_API_KEY,
       github: !!env.GITHUB_TOKEN,
       opencrawl: !!env.OPENCRAWL_TOKEN,
-      claudeCode: !!env.CLAUDE_CODE_OAUTH_TOKEN,
+      codex: !!env.CODEX_AUTH_JSON,
     },
     models: { fix: env.FIX_MODEL, extract: env.EXTRACT_MODEL },
   };

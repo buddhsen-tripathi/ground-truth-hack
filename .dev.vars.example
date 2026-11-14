@@ -14,8 +14,11 @@ DAYTONA_API_KEY=
 GITHUB_TOKEN=
 
 # Optional: OpenCrawl agent token (`opencrawl token create --name firebreak --env-file .dev.vars`).
-# Runs read and post notes on the OpenCrawl board and search agent history before repairing; Claude Code gets it over MCP.
+# Runs read and post notes on the OpenCrawl board and search agent history before repairing; Codex gets it over MCP.
 OPENCRAWL_TOKEN=
-# Optional: Claude Code token (`claude setup-token`). When set, Claude Code runs in the sandbox as the repair agent
-# instead of the Clonvo edit loop. Project code in the sandbox can see it while the agent runs.
-CLAUDE_CODE_OAUTH_TOKEN=
+# Optional: Codex sign-in, the whole of ~/.codex/auth.json from a ChatGPT login (`codex login`):
+#   wrangler secret put CODEX_AUTH_JSON < ~/.codex/auth.json
+# When set, Codex runs in the sandbox as the repair agent, with Clonvo as the fallback if it fails. Project code in
+# the sandbox can read it while Codex runs. If a sandbox refreshes the login, your local Codex may need `codex login`;
+# if your local Codex refreshes first, runs fall back to Clonvo until you put the secret again.
+CODEX_AUTH_JSON=

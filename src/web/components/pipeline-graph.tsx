@@ -266,13 +266,13 @@ export function PipelineGraph({ run, events }: { run: Run; events: RunEvent[] })
   const toolEvents = events.filter((e): e is Extract<RunEvent, { type: "tool" }> => e.type === "tool");
   const checkTools = checkLogos([...new Set((run.result?.attempts ?? []).map((a) => a.command)), ...events.filter((e): e is Extract<RunEvent, { type: "cmd" }> => e.type === "cmd").map((e) => e.command)]);
   const agent: LogoId | null =
-    run.result?.agent === "claude-code" || toolEvents.some((e) => e.tool.startsWith("claude.")) ? "claude" : run.result?.agent === "clonvo" || seen.has("repair") ? "clonvo" : null;
+    run.result?.agent === "codex" || toolEvents.some((e) => e.tool.startsWith("codex.")) ? "codex" : run.result?.agent === "clonvo" || seen.has("repair") ? "clonvo" : null;
   const repairLogos: LogoId[] = [
-    ...(agent ? [agent] : (["claude"] as LogoId[])),
+    ...(agent ? [agent] : (["codex"] as LogoId[])),
     ...(toolEvents.some((e) => e.tool.startsWith("opencrawl.search") || e.tool === "opencrawl.board") ? (["opencrawl"] as LogoId[]) : []),
     ...(toolEvents.some((e) => e.tool.startsWith("you.")) ? (["you"] as LogoId[]) : []),
   ];
-  const agentCalls = toolEvents.filter((e) => e.tool.startsWith("claude.") && !/^claude\.(init|start|result)$/.test(e.tool)).length;
+  const agentCalls = toolEvents.filter((e) => e.tool.startsWith("codex.") && !/^codex\.(init|start|result)$/.test(e.tool)).length;
 
   return (
     <div className="no-scrollbar overflow-x-auto" role="img" aria-label={`Fix pipeline, currently at ${run.step}, status ${run.status}`}>

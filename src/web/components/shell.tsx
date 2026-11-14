@@ -84,7 +84,7 @@ function WatcherPanel({ collapsed }: { collapsed: boolean }) {
     ["OSV", "osv", true],
     ["Daytona", "daytona", integrations?.daytona],
     ["GitHub", "github", integrations?.github],
-    ["Claude Code", "claude", integrations?.claudeCode],
+    ["Codex", "codex", integrations?.codex],
     ["OpenCrawl", "opencrawl", integrations?.opencrawl],
     ["Clonvo", "clonvo", integrations?.clonvo],
     ["You.com", "you", integrations?.you],

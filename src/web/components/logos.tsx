@@ -2,7 +2,6 @@ import {
   siAngular,
   siAstro,
   siBun,
-  siClaude,
   siCloudflare,
   siExpo,
   siGithub,
@@ -28,7 +27,7 @@ import { cn } from "@/lib/utils";
 /* Logos for the tools and services a run uses. Brand marks come from simple-icons; services without one get a monogram. */
 
 export type LogoId =
-  | "claude"
+  | "codex"
   | "opencrawl"
   | "daytona"
   | "you"
@@ -57,7 +56,6 @@ export type LogoId =
   | "cloudflare";
 
 const ICONS: Partial<Record<LogoId, SimpleIcon>> = {
-  claude: siClaude,
   github: siGithub,
   npm: siNpm,
   pnpm: siPnpm,
@@ -83,6 +81,7 @@ const ICONS: Partial<Record<LogoId, SimpleIcon>> = {
 
 /** Monograms for services simple-icons doesn't carry: [text, background, foreground]. */
 const MONOGRAMS: Partial<Record<LogoId, [string, string, string]>> = {
+  codex: ["cx", "#0d0d0d", "#ffffff"],
   opencrawl: ["oc", "#0f766e", "#ffffff"],
   daytona: ["D", "#111111", "#ffffff"],
   you: ["you", "#6d28d9", "#ffffff"],
@@ -91,7 +90,7 @@ const MONOGRAMS: Partial<Record<LogoId, [string, string, string]>> = {
 };
 
 export const LOGO_NAMES: Record<LogoId, string> = {
-  claude: "Claude Code",
+  codex: "Codex",
   opencrawl: "OpenCrawl",
   daytona: "Daytona",
   you: "You.com",
@@ -162,14 +161,14 @@ export function LogoTile({ id, size = 14, className }: { id: LogoId; size?: numb
 export const managerLogo = (manager: string): LogoId =>
   manager === "pnpm" ? "pnpm" : manager === "yarn" ? "yarn" : manager === "bun" ? "bun" : manager === "uv" ? "uv" : manager === "pip" ? "python" : "npm";
 
-/** Logo for a tool event id ("opencrawl.search", "claude.Bash", "expo.doctor", "you.search"). */
+/** Logo for a tool event id ("opencrawl.search", "codex.Bash", "expo.doctor", "you.search"). */
 export function toolLogo(tool: string): LogoId {
   const head = tool.split(".")[0];
-  if (head === "claude" || head === "opencrawl" || head === "expo" || head === "you" || head === "clonvo") return head;
-  return "claude";
+  if (head === "codex" || head === "opencrawl" || head === "expo" || head === "you" || head === "clonvo") return head;
+  return "codex";
 }
 
-/** "claude.Bash" → "Bash", "opencrawl.search" → "search". */
+/** "codex.Bash" → "Bash", "opencrawl.search" → "search". */
 export const toolAction = (tool: string) => tool.split(".").slice(1).join(".") || tool;
 
 /** Tools a check command uses, for the Checks step. */
